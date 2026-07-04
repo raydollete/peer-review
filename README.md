@@ -1,8 +1,7 @@
-# peer-review-mcp
+# Peer Review MCP Server
 
 A provider-agnostic MCP (Model Context Protocol) server that asks a **weighted quorum of external LLM peers** the same question and returns a consensus answer with a machine-consumable **certainty score**. It supports any OpenAI-compatible or Anthropic-compatible API, stacks sources in cost tiers, and degrades visibly (never silently) when a source is unavailable.
 
-It fully supersedes [`gemini-for-claude-mcp`](#migrating-from-gemini-for-claude-mcp): Gemini becomes just one configured source, reachable via AI Studio or Vertex AI.
 
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Node: >=20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)
@@ -315,7 +314,10 @@ Input: `text` (1–1000000 chars), optional `source`. Anthropic-compatible sourc
 
 ## Migrating from gemini-for-claude-mcp
 
-This server is a drop-in replacement: `query_peer` accepts the same `prompt`/`history` shape (`role: "user"|"model"` preserved) and returns the same payload fields as `query_gemini` plus `source`; `list_peers` covers `list_gemini_models`; `count_tokens` covers `count_gemini_tokens` (with the `method` caveat below). Configure Gemini as an ordinary source, either way:
+
+This server fully supersedes [`gemini-for-claude-mcp`](#migrating-from-gemini-for-claude-mcp): Gemini becomes just one configured source, reachable via AI Studio or Vertex AI.
+
+It is intended as a drop-in replacement: `query_peer` accepts the same `prompt`/`history` shape (`role: "user"|"model"` preserved) and returns the same payload fields as `query_gemini` plus `source`; `list_peers` covers `list_gemini_models`; `count_tokens` covers `count_gemini_tokens` (with the `method` caveat below). Configure Gemini as an ordinary source, either way:
 
 **AI Studio (static key):**
 
