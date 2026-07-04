@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test coverage
+coverage/
+
+# Local environment & config (examples are committed)
+.env
+.env.local
+peer-review.config.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor/OS
+.DS_Store
+
+# Development artifacts
+.claude/
+openspec/
