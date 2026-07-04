@@ -1,0 +1,33 @@
+{
+  "thresholds": { "tier1": 2, "tier2": 4 },
+  "arbiter": "gpt-large",
+  "sources": [
+    {
+      "name": "gpt-large",
+      "apiType": "openai",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "gpt-5.2",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "weight": 2,
+      "tier": 1
+    },
+    {
+      "name": "gemini",
+      "apiType": "openai",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "model": "gemini-3-pro",
+      "apiKeyEnv": "GEMINI_API_KEY",
+      "weight": 2,
+      "tier": 1
+    },
+    {
+      "name": "claude",
+      "apiType": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "model": "claude-fable-5",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "weight": 2,
+      "tier": 2
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "name": "peer-review-mcp",
+  "version": "0.1.0",
+  "description": "Provider-agnostic MCP server for tiered multi-LLM peer review with weighted quorum and certainty scoring",
+  "type": "module",
+  "main": "dist/app.js",
+  "bin": {
+    "peer-review-mcp": "./dist/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app.js",
+    "dev": "tsx watch src/app.ts",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --passWithNoTests",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "peer-review",
+    "quorum",
+    "llm",
+    "model-context-protocol"
+  ],
+  "author": "Ray Dollete <ray@raydollete.com>",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "neverthrow": "^7.0.0",
+    "pino": "^9.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^20.0.0",
+    "eslint": "^9.0.0",
+    "jest": "^29.7.0",
+    "pino-pretty": "^11.0.0",
+    "ts-jest": "^29.2.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}
