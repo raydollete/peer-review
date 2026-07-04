@@ -41,7 +41,7 @@ export class McpServer {
     private readonly logger: ILogger,
   ) {
     this.server = new Server(
-      { name: 'peer-review-mcp', version: '0.1.0' },
+      { name: 'peer-review-mcp', version: '1.0.0' },
       { capabilities: { tools: {} } },
     );
     this.setupHandlers();
