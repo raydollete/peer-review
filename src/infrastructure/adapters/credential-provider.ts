@@ -7,8 +7,16 @@ const execFileAsync = promisify(execFile);
 
 export type CommandRunner = (command: string) => Promise<{ stdout: string }>;
 
+// apiKeyCommand strings use POSIX sh syntax (inline env prefixes, etc.), so they must run under
+// a bourne-compatible shell on every platform. Windows has no /bin/sh — fall back to Git Bash's
+// sh.exe (overridable via PEER_REVIEW_SHELL for non-standard installs).
+const defaultShell = (): string => {
+  if (process.platform !== 'win32') return '/bin/sh';
+  return process.env['PEER_REVIEW_SHELL'] ?? 'C:\\Program Files\\Git\\usr\\bin\\sh.exe';
+};
+
 const defaultRunCommand: CommandRunner = async (command) =>
-  execFileAsync('/bin/sh', ['-c', command]);
+  execFileAsync(defaultShell(), ['-c', command]);
 
 export interface ICredentialProvider {
   getCredential(): Promise<Result<string, DomainError>>;
