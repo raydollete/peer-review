@@ -39,6 +39,16 @@ describe('tool registry', () => {
     ]);
     expect(registry.has('peer_review')).toBe(true);
   });
+
+  it('exposes callerAnswer on peer_review with blind-to-peers semantics, and not on query_peer', () => {
+    const properties = peerReviewTool.inputSchema.properties as Record<
+      string,
+      { description?: string }
+    >;
+    expect(properties['callerAnswer']?.description).toContain('Never shown to peers');
+    expect(peerReviewTool.inputSchema.required).toEqual(['prompt']);
+    expect(queryPeerTool.inputSchema.properties).not.toHaveProperty('callerAnswer');
+  });
 });
 
 describe('executeToolCall', () => {

@@ -19,6 +19,10 @@ export interface QuorumResult {
   readonly requiredWeight: number;
   readonly agreeingWeight: number;
   readonly arbiterFailed?: boolean;
+  /** Arbiter rating of the caller's own answer against the consensus, in [0, 1].
+   * Present only when the call supplied a callerAnswer; null = supplied but unrated.
+   * Carries zero quorum weight. */
+  readonly callerAgreement?: number | null;
   readonly sources: readonly QuorumSourceReport[];
   readonly usage: TokenUsage;
 }

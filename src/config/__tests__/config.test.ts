@@ -110,6 +110,13 @@ describe('peer config', () => {
     expect(() => parsePeerConfig(raw)).toThrow(/Duplicate source name/);
   });
 
+  it('fails fast on the reserved source name "caller"', () => {
+    const raw = clone();
+    raw.sources[1]!['name'] = 'caller';
+    expect(() => parsePeerConfig(raw)).toThrow(/"caller" is reserved/);
+    expect(() => parsePeerConfig(validConfig)).not.toThrow();
+  });
+
   it('marks a source with a missing apiKeyEnv var unavailable without throwing', () => {
     const config = parsePeerConfig(validConfig);
     const envSource = config.sources[0]!;

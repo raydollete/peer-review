@@ -24,6 +24,8 @@ export interface QuorumInput {
   readonly prompt: string;
   readonly history?: readonly HistoryTurn[] | undefined;
   readonly tier?: number | undefined;
+  /** The calling agent's own answer — arbiter-rated only, never sent to peers. */
+  readonly callerAnswer?: string | undefined;
 }
 
 export interface QuorumDeps {
@@ -104,7 +106,7 @@ export class PeerReviewQuorumUseCase {
       clearTimeout(timer);
       controller.abort();
     }
-    return this.assemble(state, reachedTier, requiredWeight);
+    return this.assemble(input, state, reachedTier, requiredWeight);
   }
 
   private launchTier(
@@ -162,7 +164,7 @@ export class PeerReviewQuorumUseCase {
         return;
       }
       if (!state.achieved && pending.size > 0 && this.quorumPossible(state, requiredWeight)) {
-        await this.evaluate(input.prompt, state, controller.signal, requiredWeight);
+        await this.evaluate(input, state, controller.signal, requiredWeight);
         if (state.achieved) {
           // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
           controller.abort();
@@ -172,7 +174,7 @@ export class PeerReviewQuorumUseCase {
     }
 
     if (!state.achieved && !state.deadlineHit && state.successes.length > state.evaluatedCount) {
-      await this.evaluate(input.prompt, state, controller.signal, requiredWeight);
+      await this.evaluate(input, state, controller.signal, requiredWeight);
     }
   }
 
@@ -226,15 +228,16 @@ export class PeerReviewQuorumUseCase {
   }
 
   private async evaluate(
-    question: string,
+    input: QuorumInput,
     state: RunState,
     signal: AbortSignal,
     requiredWeight: number,
   ): Promise<void> {
     const evaluation = await evaluateAgreement({
       arbiter: { name: this.deps.arbiter.name, client: this.deps.arbiter.client },
-      question,
+      question: input.prompt,
       responses: state.successes.map((s) => s.response),
+      callerAnswer: input.callerAnswer,
       signal,
       logger: this.deps.logger,
     });
@@ -268,6 +271,7 @@ export class PeerReviewQuorumUseCase {
   }
 
   private assemble(
+    input: QuorumInput,
     state: RunState,
     tier: number,
     requiredWeight: number,
@@ -294,6 +298,10 @@ export class PeerReviewQuorumUseCase {
       return ok({
         response: state.lastEval.consensus,
         certaintyScore: computeCertainty(state.agreeingWeight, requiredWeight, agreeingRatings),
+        // Last evaluation's caller rating wins across tier re-evaluations.
+        ...(input.callerAnswer !== undefined
+          ? { callerAgreement: state.lastEval.callerAgreement ?? null }
+          : {}),
         ...base,
       });
     }
@@ -306,6 +314,8 @@ export class PeerReviewQuorumUseCase {
       response: top.response.text,
       certaintyScore: 0,
       ...(state.arbiterFailed ? { arbiterFailed: true } : {}),
+      // No trusted evaluation on this path — a supplied caller answer is unrated.
+      ...(input.callerAnswer !== undefined ? { callerAgreement: null } : {}),
       ...base,
     });
   }

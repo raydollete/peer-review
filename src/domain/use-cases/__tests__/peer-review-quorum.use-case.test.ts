@@ -178,6 +178,106 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(result.sources.find((s) => s.name === 'a')?.agreement).toBe(0.9);
   });
 
+  it('never sends the caller answer to peers', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'x'));
+    const b = makeSource('b', 1, 2, answers('b', 'y'));
+    const arbiter = makeArbiter([{ a: 0.9, b: 0.9, caller: 0.8 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (
+      await useCase.execute({ prompt: 'q', callerAnswer: 'MY-SECRET-DRAFT' })
+    )._unsafeUnwrap();
+
+    expect(JSON.stringify(a.calls)).not.toContain('MY-SECRET-DRAFT');
+    expect(JSON.stringify(b.calls)).not.toContain('MY-SECRET-DRAFT');
+    expect(arbiter.calls[0]?.prompt).toContain('MY-SECRET-DRAFT');
+    expect(result.callerAgreement).toBe(0.8);
+  });
+
+  it('caller rating cannot self-certify: zero quorum weight, no sources[] entry', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Lyon'));
+    const arbiter = makeArbiter([{ a: 0.9, b: 0.2, caller: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (
+      await useCase.execute({ prompt: 'q', callerAnswer: 'Paris, obviously' })
+    )._unsafeUnwrap();
+
+    expect(result.achieved).toBe(false);
+    expect(result.agreeingWeight).toBe(2); // a only — caller's 1.0 adds nothing
+    expect(result.certaintyScore).toBeCloseTo(0.45); // min(1, 2/4) × 0.9, caller excluded
+    expect(result.callerAgreement).toBe(1);
+    expect(result.sources.map((s) => s.name).sort()).toEqual(['a', 'b']);
+  });
+
+  it('last tier re-evaluation wins for the caller rating', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Lyon'));
+    const c = makeSource('c', 2, 2, answers('c', 'Paris indeed'));
+    const arbiter = makeArbiter([
+      { a: 0.9, b: 0.2, caller: 0.3 },
+      { a: 0.9, b: 0.2, c: 0.8, caller: 0.9 },
+    ]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, c],
+      arbiter,
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (
+      await useCase.execute({ prompt: 'q', callerAnswer: 'Paris' })
+    )._unsafeUnwrap();
+
+    expect(arbiter.calls).toHaveLength(2);
+    expect(result.achieved).toBe(true);
+    expect(result.callerAgreement).toBe(0.9);
+  });
+
+  it('reports a null caller rating on the arbiter-failure fallback path', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'x'));
+    const arbiter = makeArbiter(['transport-error']);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+
+    const result = (
+      await useCase.execute({ prompt: 'q', callerAnswer: 'mine' })
+    )._unsafeUnwrap();
+
+    expect(result.arbiterFailed).toBe(true);
+    expect(result.callerAgreement).toBeNull();
+  });
+
+  it('carries no callerAgreement property when no caller answer was supplied', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'x'));
+    const arbiter = makeArbiter([{ a: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect('callerAgreement' in result).toBe(false);
+  });
+
   it('aggregates token usage across peers and arbiter', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'x'));
     const arbiter = makeArbiter([{ a: 1 }]);

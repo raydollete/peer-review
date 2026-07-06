@@ -39,6 +39,13 @@ Sources are consulted in cost tiers: cheap tier-1 peers first, escalating to hig
           'Highest tier to escalate to (defaults to the full configured stack). Lower = cheaper.',
         minimum: 1,
       },
+      callerAnswer: {
+        type: 'string',
+        description:
+          "Your own answer to the prompt. Never shown to peers — they answer blind, so their independence is preserved. The arbiter rates it against the peer consensus (zero quorum weight; it cannot self-certify) and the response returns the rating as callerAgreement.",
+        minLength: 1,
+        maxLength: 100000,
+      },
     },
     required: ['prompt'],
   },

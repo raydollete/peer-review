@@ -10,6 +10,8 @@ import {
 export interface PeerReviewResponseData {
   readonly response: string;
   readonly certaintyScore: number;
+  /** Present only when the call supplied callerAnswer; null = supplied but unrated. */
+  readonly callerAgreement?: number | null;
   readonly quorum: {
     readonly achieved: boolean;
     readonly tier: number;
@@ -48,6 +50,11 @@ export class PeerReviewController {
     return successResponse({
       response: quorum.response,
       certaintyScore: quorum.certaintyScore,
+      // Key omitted (not null) when no callerAnswer was supplied — the envelope
+      // stays byte-identical for existing clients.
+      ...(quorum.callerAgreement !== undefined
+        ? { callerAgreement: quorum.callerAgreement }
+        : {}),
       quorum: {
         achieved: quorum.achieved,
         tier: quorum.tier,

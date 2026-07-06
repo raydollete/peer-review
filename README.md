@@ -259,7 +259,7 @@ All tools return the envelope `{"success": true, "data": ...}` or `{"success": f
 
 ### `peer_review`
 
-Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack). An unmet quorum is **not** an error — check `quorum.achieved` and `certaintyScore`.
+Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack), optional `callerAnswer` (1–100000 chars — your own answer to the prompt). An unmet quorum is **not** an error — check `quorum.achieved` and `certaintyScore`.
 
 ```jsonc
 // request
@@ -283,6 +283,15 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
 ```
 
 `sources[].status` is `ok`, `error`, or `unavailable`; `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
+
+**Including your own answer (`callerAnswer`).** When you already have an answer and want to know whether independent peers endorse it, pass it as `callerAnswer` instead of pasting it into `prompt`. Peers never see it — they answer the prompt blind, so their independence is preserved and `certaintyScore` stays an anchoring-free signal. The arbiter rates your answer against the peer-derived consensus and the response gains `callerAgreement` (0–1, or `null` when the arbiter produced no rating). The rating carries **zero quorum weight** — it cannot make or break `quorum.achieved` — and the key is omitted entirely when `callerAnswer` was not supplied. The name `caller` is reserved and rejected as a configured source name.
+
+```jsonc
+// request
+{ "prompt": "What is the capital of France?", "callerAnswer": "Paris" }
+// response data gains:
+{ "callerAgreement": 1, ... }
+```
 
 ### `query_peer`
 

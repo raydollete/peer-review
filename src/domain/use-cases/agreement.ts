@@ -5,7 +5,13 @@ import type { IPeerClient } from '../ports/index.js';
 import { ExternalServiceError, type DomainError } from '../errors/index.js';
 import type { ILogger } from '../../shared/logger/index.js';
 import { sanitizeModelText, stripCodeFences } from '../../shared/text/index.js';
-import { ARBITER_SYSTEM_PROMPT, buildArbiterPrompt, REASK_SUFFIX } from './agreement-prompt.js';
+import {
+  ARBITER_SYSTEM_PROMPT,
+  CALLER_RULES_SUFFIX,
+  CALLER_SOURCE_NAME,
+  buildArbiterPrompt,
+  REASK_SUFFIX,
+} from './agreement-prompt.js';
 
 /** A source agrees with the consensus when its rating meets this threshold. */
 export const AGREEMENT_THRESHOLD = 0.7;
@@ -22,7 +28,10 @@ export interface AgreementRating {
 
 export interface AgreementEvaluation {
   readonly consensus: string;
+  /** Peer ratings only — the caller's rating is split out and never appears here. */
   readonly ratings: readonly AgreementRating[];
+  /** Set only when a callerAnswer was supplied; null = the arbiter omitted the rating. */
+  readonly callerAgreement?: number | null;
   readonly usage: TokenUsage;
 }
 
@@ -30,6 +39,8 @@ export interface EvaluateAgreementParams {
   readonly arbiter: { readonly name: string; readonly client: IPeerClient };
   readonly question: string;
   readonly responses: readonly PeerResponse[];
+  /** The calling agent's own answer — rated by the arbiter, never sent to peers. */
+  readonly callerAnswer?: string | undefined;
   readonly signal?: AbortSignal | undefined;
   readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
@@ -90,6 +101,28 @@ export function extractJson(text: string): unknown {
 }
 
 /**
+ * Split the caller's rating out of the peer ratings so no downstream consumer
+ * (quorum weight, sources[]) ever sees a phantom "caller" peer. With no
+ * callerAnswer supplied, a hallucinated caller entry is dropped.
+ */
+function splitCallerRating(
+  ratings: readonly AgreementRating[],
+  params: EvaluateAgreementParams,
+): { peerRatings: readonly AgreementRating[]; callerAgreement?: number | null } {
+  const peerRatings = ratings.filter((r) => r.name !== CALLER_SOURCE_NAME);
+  if (params.callerAnswer === undefined) {
+    return { peerRatings };
+  }
+  const callerRating = ratings.find((r) => r.name === CALLER_SOURCE_NAME);
+  if (callerRating === undefined) {
+    params.logger?.warn('Arbiter omitted the caller rating', {
+      arbiter: params.arbiter.name,
+    });
+  }
+  return { peerRatings, callerAgreement: callerRating?.agreement ?? null };
+}
+
+/**
  * Ask the arbiter (temperature 0) to rate each peer response against its own
  * consensus answer. Peer responses are passed as delimited data, never as
  * instructions. One re-ask on malformed JSON; transport errors fail immediately.
@@ -100,13 +133,18 @@ export async function evaluateAgreement(
   const basePrompt = buildArbiterPrompt(
     params.question,
     params.responses.map((response) => ({ source: response.source, text: response.text })),
+    params.callerAnswer,
   );
+  const systemInstruction =
+    params.callerAnswer === undefined
+      ? ARBITER_SYSTEM_PROMPT
+      : ARBITER_SYSTEM_PROMPT + CALLER_RULES_SUFFIX;
   const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
   for (const attempt of [0, 1]) {
     const result = await params.arbiter.client.complete({
       prompt: attempt === 0 ? basePrompt : basePrompt + REASK_SUFFIX,
-      systemInstruction: ARBITER_SYSTEM_PROMPT,
+      systemInstruction,
       temperature: 0,
       signal: params.signal,
     });
@@ -119,7 +157,13 @@ export async function evaluateAgreement(
 
     const parsed = EvaluationSchema.safeParse(extractJson(result.value.text));
     if (parsed.success) {
-      return ok({ consensus: parsed.data.consensus, ratings: parsed.data.ratings, usage });
+      const { peerRatings, callerAgreement } = splitCallerRating(parsed.data.ratings, params);
+      return ok({
+        consensus: parsed.data.consensus,
+        ratings: peerRatings,
+        ...(callerAgreement !== undefined ? { callerAgreement } : {}),
+        usage,
+      });
     }
     params.logger?.warn('Arbiter reply failed JSON extraction', {
       arbiter: params.arbiter.name,

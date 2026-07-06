@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { CALLER_SOURCE_NAME } from '../domain/use-cases/agreement-prompt.js';
 import { ConfigurationError } from '../shared/errors/index.js';
 
 const SourceSchema = z.object({
@@ -51,6 +52,11 @@ function normalizeThresholds(raw: Record<string, number>): Record<number, number
 function crossValidate(config: PeerReviewConfig): void {
   const names = new Set<string>();
   for (const source of config.sources) {
+    if (source.name === CALLER_SOURCE_NAME) {
+      throw new ConfigurationError(
+        `Source name "${CALLER_SOURCE_NAME}" is reserved for the caller-answer rating channel`,
+      );
+    }
     if (names.has(source.name)) {
       throw new ConfigurationError(`Duplicate source name: "${source.name}"`);
     }

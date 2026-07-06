@@ -59,6 +59,33 @@ describe('PeerReviewController', () => {
     expect(result.error?.code).toBe('VALIDATION_ERROR');
   });
 
+  it('returns callerAgreement when callerAnswer is supplied, omits the key otherwise', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+    const quorum = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter: makeArbiter([{ a: 0.9, b: 0.9, caller: 0.7 }]),
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+    const controller = new PeerReviewController(quorum);
+
+    const withCaller = await controller.handle({ prompt: 'q', callerAnswer: 'my draft' });
+    expect(withCaller.success).toBe(true);
+    expect(withCaller.data?.callerAgreement).toBe(0.7);
+
+    const without = await controller.handle({ prompt: 'q' });
+    expect(without.success).toBe(true);
+    expect(without.data !== undefined && 'callerAgreement' in without.data).toBe(false);
+  });
+
+  it('rejects an empty callerAnswer with VALIDATION_ERROR', async () => {
+    const { peerReview } = buildControllers();
+    const result = await peerReview.handle({ prompt: 'q', callerAnswer: '' });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('VALIDATION_ERROR');
+  });
+
   it('rejects a client-supplied model/temperature override (strict schema)', async () => {
     const { peerReview } = buildControllers();
     const withModel = await peerReview.handle({ prompt: 'q', model: 'evil-model' });
