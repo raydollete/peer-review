@@ -82,7 +82,7 @@ The server reads a JSON config file from `PEER_REVIEW_CONFIG` (default `./peer-r
 | `sources[].weight` | positive int | yes | Weight this source contributes to quorum when it agrees with the consensus. |
 | `sources[].tier` | positive int | yes | Cost tier. Tier 1 is consulted first; higher tiers only on shortfall. |
 
-Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, or a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`. Credential material never appears in config, logs, or responses.
+Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), or a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`. Credential material never appears in config, logs, or responses.
 
 ### Environment variables
 
@@ -251,7 +251,36 @@ Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `
 
 Had the arbiter itself been the casualty (e.g. `OPENAI_API_KEY` missing in this config), no agreement could be evaluated at all and the response would instead carry the highest-weighted successful answer with `"certaintyScore": 0` and `"quorum": { "arbiterFailed": true, ... }`.
 
-**Reading the result**: gate any automated decision on `quorum.achieved`, treat `certaintyScore` as the confidence dial (it discounts both shortfall and lukewarm agreement), and scan `sources[]` for `error`/`unavailable` entries — a degraded quorum is always visible, never silent.
+#### 5. Checking your own answer — `callerAnswer` the peers disagree with
+
+`{ "prompt": "In JavaScript, does [10, 9, 100].sort() return [9, 10, 100]?", "callerAnswer": "Yes, sort() orders numbers ascending by default." }`
+
+You already have an answer and want independent endorsement. The peers never see `callerAnswer` — they answer the prompt blind. Tier 1's two flash voters agree with each other but can't reach weight 4, so tier 2 is pulled in; `gemini-pro` agrees too and quorum lands at tier 2 (1 + 1 + 2 = 4). The arbiter separately rates your answer against the peer consensus and returns `callerAgreement` — low here, because default `sort()` is lexicographic (`[10, 100, 9]`), so your answer contradicts what the peers concluded.
+
+```jsonc
+// data
+{
+  "response": "No — Array.prototype.sort() coerces elements to strings by default, so [10, 9, 100].sort() returns [10, 100, 9]. Pass a comparator, e.g. .sort((a, b) => a - b), for numeric order.",
+  "certaintyScore": 0.98,       // peers-only: min(1, 4/4) × mean(1.0, 1.0, 0.95) — unaffected by callerAnswer
+  "callerAgreement": 0.1,       // arbiter rated your answer against the peer consensus; it contradicts it
+  "quorum": {
+    "achieved": true,           // the peers reached quorum with each other; your answer carries no weight
+    "tier": 2,
+    "requiredWeight": 4,
+    "agreeingWeight": 4,
+    "sources": [
+      { "name": "gemini-flash", "model": "gemini-3-flash-preview", "status": "ok", "weight": 1, "agreement": 1 },
+      { "name": "gpt-mini",     "model": "gpt-5-mini",             "status": "ok", "weight": 1, "agreement": 1 },
+      { "name": "gemini-pro",   "model": "gemini-3-pro",           "status": "ok", "weight": 2, "agreement": 0.95 }
+    ]
+  },
+  "tokenUsage": { "prompt": 934, "completion": 141, "total": 1075 }
+}
+```
+
+`quorum.achieved: true` with `callerAgreement: 0.1` is the signal to catch: the peers are confident, but **not** with you — treat it as a flag to revise your answer. Had you been right, `callerAgreement` would sit near 1 alongside the same high `certaintyScore`. Note `caller` never appears in `sources[]` and its rating never moved `agreeingWeight`.
+
+**Reading the result**: gate any automated decision on `quorum.achieved`, treat `certaintyScore` as the confidence dial (it discounts both shortfall and lukewarm agreement), scan `sources[]` for `error`/`unavailable` entries — a degraded quorum is always visible, never silent — and, when you passed a `callerAnswer`, read `callerAgreement` as the separate "did the peers land where I did?" signal (scenario 5).
 
 ## Tools
 
@@ -284,14 +313,29 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
 
 `sources[].status` is `ok`, `error`, or `unavailable`; `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
 
-**Including your own answer (`callerAnswer`).** When you already have an answer and want to know whether independent peers endorse it, pass it as `callerAnswer` instead of pasting it into `prompt`. Peers never see it — they answer the prompt blind, so their independence is preserved and `certaintyScore` stays an anchoring-free signal. The arbiter rates your answer against the peer-derived consensus and the response gains `callerAgreement` (0–1, or `null` when the arbiter produced no rating). The rating carries **zero quorum weight** — it cannot make or break `quorum.achieved` — and the key is omitted entirely when `callerAnswer` was not supplied. The name `caller` is reserved and rejected as a configured source name.
+**Including your own answer (`callerAnswer`).** When you already have an answer and want to know whether independent peers endorse it, pass it as `callerAnswer` instead of pasting it into `prompt`. Peers never see it — they answer the prompt blind, so their independence is preserved and `certaintyScore` stays an anchoring-free signal. The arbiter is instructed to derive the consensus **only** from the peer answers and then rate your answer against that consensus, so a confidently-wrong `callerAnswer` cannot pull the consensus toward itself. The response gains a `callerAgreement` field (0–1).
+
+How it behaves:
+
+- **Zero quorum weight.** `callerAgreement` is reported alongside the quorum but never counted into `agreeingWeight`, `quorum.achieved`, or `certaintyScore` — your own answer cannot self-certify. Read it as a separate signal: "did independent peers land where I did?"
+- **Present only when supplied.** The key is omitted entirely from the response when `callerAnswer` was not passed. When it *was* passed, the key is always present.
+- **`null` when unrated.** `callerAgreement` is `null` if the arbiter returned no rating for it — either because the arbiter omitted the `caller` entry from its ratings, or because there was no trusted evaluation at all (arbiter failed, or quorum ran with no ratable peer response — the same fallback paths that force `certaintyScore: 0`). A supplied `callerAnswer` therefore always yields the key, but not always a number.
+- **Reserved name.** `caller` is reserved as the internal rating channel and is rejected as a configured `sources[].name` at startup.
 
 ```jsonc
 // request
 { "prompt": "What is the capital of France?", "callerAnswer": "Paris" }
-// response data gains:
-{ "callerAgreement": 1, ... }
+// response data — same shape as a normal peer_review, plus callerAgreement:
+{
+  "response": "Paris",
+  "certaintyScore": 1,            // unchanged by callerAnswer — derived from peers only
+  "callerAgreement": 1,          // arbiter's 0–1 rating of "Paris" vs the peer consensus
+  "quorum": { "achieved": true, "requiredWeight": 2, "agreeingWeight": 2, /* … */ },
+  "tokenUsage": { "prompt": 315, "completion": 45, "total": 360 }
+}
 ```
+
+When your answer diverges from what the peers conclude, `callerAgreement` drops toward 0 while `certaintyScore` still reflects the peers' own convergence — e.g. `{ "callerAgreement": 0.15, "certaintyScore": 0.97 }` reads as "the peers strongly agree, but not with you."
 
 ### `query_peer`
 

@@ -1,6 +1,6 @@
 {
   "name": "peer-review-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Provider-agnostic MCP server for tiered multi-LLM peer review with weighted quorum and certainty scoring",
   "type": "module",
   "main": "dist/app.js",
