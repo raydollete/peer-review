@@ -47,7 +47,7 @@ function buildSources(logger: ILogger): { sources: PeerSource[]; arbiterName: st
       weight: source.weight,
       tier: source.tier,
       available,
-      client: createAdapter(source, limits, credentialProvider),
+      client: createAdapter(source, limits, credentialProvider, {}, logger),
     };
   });
 
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   }
 
   const peerReviewController = new PeerReviewController(
-    new PeerReviewQuorumUseCase({ sources, arbiter, thresholds, deadlineMs }),
+    new PeerReviewQuorumUseCase({ sources, arbiter, thresholds, deadlineMs, logger }),
   );
   const queryPeerController = new QueryPeerController(new QueryPeerUseCase(sources));
   const listPeersController = new ListPeersController(new ListPeersUseCase(sources));

@@ -181,4 +181,32 @@ describe('adapter factory', () => {
     );
     expect(adapter).toBeInstanceOf(AnthropicCompatAdapter);
   });
+
+  it('applies per-source limit overrides while others keep the global limits', async () => {
+    const source = {
+      name: 's',
+      apiType: 'openai' as const,
+      baseUrl: 'https://x.example',
+      model: 'm',
+      apiKeyEnv: 'K',
+      weight: 1,
+      tier: 1,
+    };
+    const success = (): Response =>
+      jsonResponse({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] });
+
+    const overrideFetch = jest.fn<typeof fetch>().mockResolvedValue(success());
+    await createAdapter(
+      { ...source, timeoutMs: 180000, maxOutputTokens: 16384 },
+      limits,
+      new StubCredentialProvider('k'),
+      instantDeps(overrideFetch),
+    ).complete({ prompt: 'q' });
+    expect(JSON.parse(String(overrideFetch.mock.calls[0]![1]?.body)).max_tokens).toBe(16384);
+
+    const defaultFetch = jest.fn<typeof fetch>().mockResolvedValue(success());
+    await createAdapter(source, limits, new StubCredentialProvider('k'), instantDeps(defaultFetch))
+      .complete({ prompt: 'q' });
+    expect(JSON.parse(String(defaultFetch.mock.calls[0]![1]?.body)).max_tokens).toBe(100);
+  });
 });

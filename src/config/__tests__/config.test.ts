@@ -39,6 +39,29 @@ describe('peer config', () => {
     expect(config.sources).toHaveLength(2);
   });
 
+  it('parses optional per-source timeoutMs and maxOutputTokens', () => {
+    const raw = clone();
+    raw.sources[0]!['timeoutMs'] = 180000;
+    raw.sources[0]!['maxOutputTokens'] = 16384;
+    const config = parsePeerConfig(raw);
+    expect(config.sources[0]?.timeoutMs).toBe(180000);
+    expect(config.sources[0]?.maxOutputTokens).toBe(16384);
+    expect(config.sources[1]?.timeoutMs).toBeUndefined();
+    expect(config.sources[1]?.maxOutputTokens).toBeUndefined();
+  });
+
+  it('rejects non-positive or non-integer per-source limits', () => {
+    for (const [key, value] of [
+      ['timeoutMs', 0],
+      ['timeoutMs', -5],
+      ['maxOutputTokens', 1.5],
+    ] as const) {
+      const raw = clone();
+      raw.sources[0]![key] = value;
+      expect(() => parsePeerConfig(raw)).toThrow(ConfigurationError);
+    }
+  });
+
   it('accepts bare numeric threshold keys', () => {
     const raw = clone();
     (raw as Record<string, unknown>)['thresholds'] = { '1': 2, '2': 4 };
@@ -105,7 +128,7 @@ describe('env config', () => {
     const { loadEnvConfig } = await import('../env.config.js');
     const env = loadEnvConfig({});
     expect(env.timeoutMs).toBe(120000);
-    expect(env.deadlineMs).toBe(240000);
+    expect(env.deadlineMs).toBe(480000);
     expect(env.maxOutputTokens).toBe(8192);
     expect(env.credentialTtlS).toBe(3000);
     expect(env.logLevel).toBe('info');

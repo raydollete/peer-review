@@ -1,7 +1,21 @@
-import { evaluateAgreement, computeCertainty, AGREEMENT_THRESHOLD } from '../agreement.js';
+import { jest } from '@jest/globals';
+import { ok } from 'neverthrow';
+import { evaluateAgreement, computeCertainty, extractJson, AGREEMENT_THRESHOLD } from '../agreement.js';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
 import { ExternalServiceError } from '../../errors/index.js';
-import { makeSource, makeArbiter, answers, peerResponse } from './helpers.js';
+import { makeSource, makeArbiter, answers, peerResponse, type TestSource } from './helpers.js';
+
+/** Arbiter replying with the i-th raw text; the last entry repeats. */
+function arbiterSaying(...texts: string[]): TestSource {
+  let call = 0;
+  return makeSource('arbiter', 99, 1, async () => {
+    const text = texts[Math.min(call, texts.length - 1)]!;
+    call += 1;
+    return ok(peerResponse('arbiter', text));
+  });
+}
+
+const VALID_VERDICT = '{"consensus": "final", "ratings": [{"name": "alpha", "agreement": 0.9}]}';
 
 describe('evaluateAgreement', () => {
   it('calls the arbiter at temperature 0 with responses as delimited data', async () => {
@@ -63,6 +77,74 @@ describe('evaluateAgreement', () => {
       responses: [peerResponse('alpha', 'a')],
     });
     expect(result._unsafeUnwrap().ratings).toEqual([{ name: 'alpha', agreement: 0.75 }]);
+  });
+
+  it('ignores a decoy JSON draft inside a think block, no re-ask', async () => {
+    const arbiter = arbiterSaying(
+      `<think>draft: {"consensus": "draft", "ratings": []} — needs work</think>\n${VALID_VERDICT}`,
+    );
+    const result = await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+    });
+    expect(result._unsafeUnwrap().consensus).toBe('final');
+    expect(arbiter.calls).toHaveLength(1);
+  });
+
+  it('re-asks when an unclosed think block swallows the verdict', async () => {
+    const arbiter = arbiterSaying(`<think>still reasoning ${VALID_VERDICT}`, VALID_VERDICT);
+    const result = await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+    });
+    expect(result._unsafeUnwrap().consensus).toBe('final');
+    expect(arbiter.calls).toHaveLength(2);
+  });
+
+  it('warns with a snippet on each failed extraction attempt', async () => {
+    const warn = jest.fn();
+    const arbiter = arbiterSaying('no json here', 'still no json');
+    const result = await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+      logger: { warn },
+    });
+    expect(result.isErr()).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1]![1]).toMatchObject({ attempt: 1, snippet: 'still no json' });
+  });
+});
+
+describe('extractJson', () => {
+  it('takes the last parseable object when prose with braces precedes it', () => {
+    expect(extractJson(`Ratings differ for {a,b}. ${VALID_VERDICT}`)).toMatchObject({
+      consensus: 'final',
+    });
+  });
+
+  it('skips a trailing invalid object in favour of an earlier valid one', () => {
+    expect(extractJson(`${VALID_VERDICT} trailing {not: json,}`)).toMatchObject({
+      consensus: 'final',
+    });
+  });
+
+  it('is not confused by braces and escaped quotes inside string values', () => {
+    const tricky = '{"consensus": "use {x} and \\"y\\"", "ratings": []}';
+    expect(extractJson(tricky)).toEqual({ consensus: 'use {x} and "y"', ratings: [] });
+  });
+
+  it('handles a think block followed by a fenced verdict', () => {
+    const text = `<think>hmm {1,2}</think>\n\`\`\`json\n${VALID_VERDICT}\n\`\`\``;
+    expect(extractJson(text)).toMatchObject({ consensus: 'final' });
+  });
+
+  it('returns undefined when nothing parses', () => {
+    expect(extractJson('no braces at all')).toBeUndefined();
+    expect(extractJson('{never closed')).toBeUndefined();
+    expect(extractJson('{bad} {also bad,}')).toBeUndefined();
   });
 });
 

@@ -1,5 +1,6 @@
 import type { IPeerClient } from '../../domain/ports/index.js';
 import type { SourceConfig } from '../../config/index.js';
+import type { ILogger } from '../../shared/logger/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 import { OpenAiCompatAdapter } from './openai-compat.adapter.js';
 import { AnthropicCompatAdapter } from './anthropic-compat.adapter.js';
@@ -15,14 +16,16 @@ export function createAdapter(
   limits: AdapterLimits,
   credentialProvider: ICredentialProvider,
   deps: HttpDeps = {},
+  logger?: Pick<ILogger, 'warn'>,
 ): IPeerClient {
   const cfg = {
     sourceName: source.name,
     baseUrl: source.baseUrl,
     model: source.model,
-    timeoutMs: limits.timeoutMs,
-    maxOutputTokens: limits.maxOutputTokens,
+    timeoutMs: source.timeoutMs ?? limits.timeoutMs,
+    maxOutputTokens: source.maxOutputTokens ?? limits.maxOutputTokens,
     credentialProvider,
+    ...(logger !== undefined ? { logger } : {}),
   };
   switch (source.apiType) {
     case 'openai':

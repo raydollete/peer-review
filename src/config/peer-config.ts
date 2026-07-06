@@ -11,6 +11,11 @@ const SourceSchema = z.object({
   apiKeyCommand: z.string().min(1).optional(),
   weight: z.number().int().positive(),
   tier: z.number().int().positive(),
+  // Per-source overrides for the global PEER_TIMEOUT_MS / PEER_MAX_OUTPUT_TOKENS
+  // envelopes — reasoning models need longer timeouts and larger output budgets
+  // (hidden thinking is billed against max_tokens before the answer).
+  timeoutMs: z.number().int().positive().optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
 });
 
 const TIER_KEY_PATTERN = /^(?:tier)?([0-9]+)$/;

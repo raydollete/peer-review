@@ -3,6 +3,8 @@ import { z } from 'zod';
 import type { IPeerClient } from '../../domain/ports/index.js';
 import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
+import type { ILogger } from '../../shared/logger/index.js';
+import { sanitizeModelText } from '../../shared/text/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 import { postJson, type HttpDeps } from './http.js';
 
@@ -10,7 +12,14 @@ const CompletionSchema = z.object({
   choices: z
     .array(
       z.object({
-        message: z.object({ content: z.string().nullable() }),
+        // Reasoning endpoints may omit `content` entirely or park text in
+        // `reasoning_content`/`reasoning`; some gateways send `reasoning` as an
+        // object, which degrades to absent rather than failing the response.
+        message: z.object({
+          content: z.string().nullish(),
+          reasoning_content: z.string().nullish().catch(undefined),
+          reasoning: z.string().nullish().catch(undefined),
+        }),
         finish_reason: z.string().nullish(),
       }),
     )
@@ -24,6 +33,8 @@ const CompletionSchema = z.object({
     .optional(),
 });
 
+type CompletionMessage = z.infer<typeof CompletionSchema>['choices'][number]['message'];
+
 export interface OpenAiCompatAdapterConfig {
   readonly sourceName: string;
   readonly baseUrl: string;
@@ -31,6 +42,7 @@ export interface OpenAiCompatAdapterConfig {
   readonly timeoutMs: number;
   readonly maxOutputTokens: number;
   readonly credentialProvider: ICredentialProvider;
+  readonly logger?: Pick<ILogger, 'warn'>;
 }
 
 type WireMessage = { role: 'system' | 'user' | 'assistant'; content: string };
@@ -107,16 +119,54 @@ export class OpenAiCompatAdapter implements IPeerClient {
       );
     }
     const usage = parsed.data.usage;
+    const finishReason = choice.finish_reason ?? 'unknown';
+    const text = this.extractText(choice.message, finishReason);
+    if (text.isErr()) {
+      return err(text.error);
+    }
+    if (finishReason === 'length') {
+      this.cfg.logger?.warn('Peer response truncated at max_tokens', {
+        source: this.cfg.sourceName,
+        finishReason,
+        snippet: text.value.slice(0, 300),
+      });
+    }
     return ok({
-      text: choice.message.content ?? '',
+      text: text.value,
       model: this.cfg.model,
       source: this.cfg.sourceName,
-      finishReason: choice.finish_reason ?? 'unknown',
+      finishReason,
       usage: {
         promptTokens: usage?.prompt_tokens ?? 0,
         completionTokens: usage?.completion_tokens ?? 0,
         totalTokens: usage?.total_tokens ?? 0,
       },
     });
+  }
+
+  /** Answer text lives in `content`; fall back to the reasoning fields only
+   * when content is empty (gateways that never populate `content`). */
+  private extractText(
+    message: CompletionMessage,
+    finishReason: string,
+  ): Result<string, DomainError> {
+    let text = sanitizeModelText(message.content ?? '');
+    if (text === '') {
+      text = sanitizeModelText(message.reasoning_content ?? message.reasoning ?? '');
+    }
+    if (text !== '') {
+      return ok(text);
+    }
+    this.cfg.logger?.warn('Peer returned empty text after sanitization', {
+      source: this.cfg.sourceName,
+      finishReason,
+      snippet: (message.content ?? message.reasoning_content ?? '').slice(0, 300),
+    });
+    return err(
+      new ExternalServiceError(
+        `Peer returned no usable text (finish_reason=${finishReason})`,
+        this.cfg.sourceName,
+      ),
+    );
   }
 }

@@ -3,6 +3,8 @@ import { z } from 'zod';
 import type { PeerResponse, TokenUsage } from '../entities/index.js';
 import type { IPeerClient } from '../ports/index.js';
 import { ExternalServiceError, type DomainError } from '../errors/index.js';
+import type { ILogger } from '../../shared/logger/index.js';
+import { sanitizeModelText, stripCodeFences } from '../../shared/text/index.js';
 import { ARBITER_SYSTEM_PROMPT, buildArbiterPrompt, REASK_SUFFIX } from './agreement-prompt.js';
 
 /** A source agrees with the consensus when its rating meets this threshold. */
@@ -29,19 +31,62 @@ export interface EvaluateAgreementParams {
   readonly question: string;
   readonly responses: readonly PeerResponse[];
   readonly signal?: AbortSignal | undefined;
+  readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
 
-function extractJson(text: string): unknown {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) {
-    return undefined;
+/** Balanced top-level `{…}` spans, tracked across JSON string/escape state so
+ * braces inside string values don't split a candidate. */
+function jsonCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"' && depth > 0) {
+      inString = true;
+    } else if (ch === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+    } else if (ch === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
   }
-  try {
-    return JSON.parse(text.slice(start, end + 1)) as unknown;
-  } catch {
-    return undefined;
+  return candidates;
+}
+
+/**
+ * Reasoning models may leak thinking, prose, or JSON-shaped drafts around the
+ * verdict; the final answer comes last, so candidates are tried last-first.
+ */
+export function extractJson(text: string): unknown {
+  const cleaned = stripCodeFences(sanitizeModelText(text));
+  const candidates = jsonCandidates(cleaned);
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    try {
+      return JSON.parse(candidates[i]!) as unknown;
+    } catch {
+      // Not valid JSON — try the previous candidate.
+    }
   }
+  return undefined;
 }
 
 /**
@@ -76,6 +121,12 @@ export async function evaluateAgreement(
     if (parsed.success) {
       return ok({ consensus: parsed.data.consensus, ratings: parsed.data.ratings, usage });
     }
+    params.logger?.warn('Arbiter reply failed JSON extraction', {
+      arbiter: params.arbiter.name,
+      attempt,
+      finishReason: result.value.finishReason,
+      snippet: result.value.text.slice(0, 300),
+    });
   }
 
   return err(

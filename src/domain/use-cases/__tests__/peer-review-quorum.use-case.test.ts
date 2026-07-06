@@ -1,8 +1,34 @@
+import { err } from 'neverthrow';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
 import { ValidationError } from '../../errors/index.js';
+import { ExternalServiceError } from '../../../shared/errors/index.js';
 import { makeSource, makeArbiter, answers, resolvesOnAbortOnly } from './helpers.js';
 
 describe('PeerReviewQuorumUseCase', () => {
+  it('reports a no-usable-text peer as error and reaches quorum on remaining weight', async () => {
+    const empty = makeSource('empty', 1, 2, async () =>
+      err(new ExternalServiceError('Peer returned no usable text (finish_reason=length)', 'empty')),
+    );
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Paris.'));
+    const arbiter = makeArbiter([{ a: 0.9, b: 0.8 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [empty, a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'Capital of France?' }))._unsafeUnwrap();
+
+    const report = result.sources.find((s) => s.name === 'empty');
+    expect(report?.status).toBe('error');
+    expect(report?.agreement).toBeNull();
+    expect(result.achieved).toBe(true);
+    expect(result.agreeingWeight).toBe(4);
+    expect(result.certaintyScore).toBeGreaterThan(0);
+  });
+
   it('tier-1 quorum stops escalation — no tier-2 source is called', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'Paris'));
     const b = makeSource('b', 1, 2, answers('b', 'Paris.'));

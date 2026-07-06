@@ -18,6 +18,7 @@ import {
   evaluateAgreement,
   type AgreementEvaluation,
 } from './agreement.js';
+import type { ILogger } from '../../shared/logger/index.js';
 
 export interface QuorumInput {
   readonly prompt: string;
@@ -30,6 +31,7 @@ export interface QuorumDeps {
   readonly arbiter: PeerSource;
   readonly thresholds: Readonly<Record<number, number>>;
   readonly deadlineMs: number;
+  readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
 
 interface MutableReport {
@@ -215,6 +217,11 @@ export class PeerReviewQuorumUseCase {
     } else {
       report.status =
         settled.result.error instanceof ConfigurationError ? 'unavailable' : 'error';
+      this.deps.logger?.warn('Peer failed during quorum', {
+        source: settled.source.name,
+        status: report.status,
+        error: settled.result.error.message,
+      });
     }
   }
 
@@ -229,6 +236,7 @@ export class PeerReviewQuorumUseCase {
       question,
       responses: state.successes.map((s) => s.response),
       signal,
+      logger: this.deps.logger,
     });
     if (evaluation.isErr()) {
       state.arbiterFailed = true;

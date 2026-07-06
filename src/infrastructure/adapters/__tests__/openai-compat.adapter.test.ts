@@ -17,7 +17,10 @@ const successFixture = {
   usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
 };
 
-function makeAdapter(fetchFn: typeof fetch): OpenAiCompatAdapter {
+function makeAdapter(
+  fetchFn: typeof fetch,
+  logger?: { warn: (message: string, context?: Record<string, unknown>) => void },
+): OpenAiCompatAdapter {
   return new OpenAiCompatAdapter(
     {
       sourceName: 'gpt-large',
@@ -26,9 +29,22 @@ function makeAdapter(fetchFn: typeof fetch): OpenAiCompatAdapter {
       timeoutMs: 5000,
       maxOutputTokens: 1024,
       credentialProvider: new StubCredentialProvider('sk-test'),
+      ...(logger !== undefined ? { logger } : {}),
     },
     instantDeps(fetchFn),
   );
+}
+
+function completionFixture(
+  message: Record<string, unknown>,
+  finishReason = 'stop',
+): Record<string, unknown> {
+  return {
+    id: 'chatcmpl-r1',
+    object: 'chat.completion',
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+    usage: { prompt_tokens: 10, completion_tokens: 900, total_tokens: 910 },
+  };
 }
 
 describe('OpenAiCompatAdapter', () => {
@@ -102,6 +118,102 @@ describe('OpenAiCompatAdapter', () => {
       .mockResolvedValue(jsonResponse({ unexpected: 'shape' }));
     const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
     expect(result._unsafeUnwrapErr()).toBeInstanceOf(ExternalServiceError);
+  });
+
+  it('strips think blocks containing braces from content', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        completionFixture({
+          role: 'assistant',
+          content: '<think>maybe {"draft": 1} then {x}</think>\nUse awk.',
+        }),
+      ),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Use awk.');
+  });
+
+  it('trims leading whitespace left by gateway think-stripping', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(completionFixture({ role: 'assistant', content: '\n\nUse awk.' })),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Use awk.');
+  });
+
+  it('falls back to reasoning_content when content is null', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        completionFixture({ role: 'assistant', content: null, reasoning_content: 'Use awk.' }),
+      ),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Use awk.');
+  });
+
+  it('accepts a message with no content key at all', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(completionFixture({ role: 'assistant', reasoning_content: 'Use awk.' })),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Use awk.');
+  });
+
+  it('tolerates object-shaped reasoning fields', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        completionFixture({
+          role: 'assistant',
+          content: 'Use awk.',
+          reasoning: { tokens: 512 },
+        }),
+      ),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Use awk.');
+  });
+
+  it('errors on unclosed think exhausting the reply (finish_reason=length)', async () => {
+    const warn = jest.fn();
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        completionFixture(
+          { role: 'assistant', content: '<think>ran out of budget while reasoning' },
+          'length',
+        ),
+      ),
+    );
+    const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error.message).toContain('finish_reason=length');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toMatchObject({ finishReason: 'length' });
+  });
+
+  it('errors with a warn snippet on empty content and no reasoning fields', async () => {
+    const warn = jest.fn();
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(completionFixture({ role: 'assistant', content: '' })),
+    );
+    const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrapErr().message).toContain('finish_reason=stop');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toHaveProperty('snippet');
+  });
+
+  it('keeps a truncated but non-empty reply and warns', async () => {
+    const warn = jest.fn();
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        completionFixture({ role: 'assistant', content: 'Partial answer that got cut' }, 'length'),
+      ),
+    );
+    const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
+    const response = result._unsafeUnwrap();
+    expect(response.text).toBe('Partial answer that got cut');
+    expect(response.finishReason).toBe('length');
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it('countTokens estimates ceil(chars/4) and labels the method', async () => {

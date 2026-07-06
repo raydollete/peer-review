@@ -27,7 +27,9 @@
       "model": "claude-fable-5",
       "apiKeyEnv": "ANTHROPIC_API_KEY",
       "weight": 2,
-      "tier": 2
+      "tier": 2,
+      "timeoutMs": 180000,
+      "maxOutputTokens": 16384
     }
   ]
 }
