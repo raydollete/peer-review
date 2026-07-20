@@ -113,7 +113,7 @@ So with the Quick Start config (`{"tier1": 2, "tier2": 4}`), a default call must
 Execution order for one call:
 
 1. All sources of the lowest tier are queried **in parallel**.
-2. As soon as the responses in hand could arithmetically meet the required weight, the arbiter (at temperature 0) rates each response 0–1 against its own consensus answer. A source **agrees** when its rating is ≥ 0.7; only agreeing sources' weights count.
+2. The arbiter (at temperature 0) rates each response 0–1 against its own consensus answer. A source **agrees** when its rating is ≥ 0.7; only agreeing sources' weights count. Evaluation is triggered mid-tier as soon as the responses in hand could arithmetically meet the required weight — and again at the end of every tier, whether or not the required weight was reachable, so the accumulated answers are always rated before escalating.
 3. If agreeing weight ≥ required weight, quorum is achieved: any still-in-flight requests are aborted (cost saved) and the arbiter's consensus answer is returned.
 4. Otherwise the next tier fans out and the arbiter re-rates over **all** accumulated responses — earlier answers are never discarded.
 5. Tiers that were never reached do not appear in `quorum.sources[]` at all.
@@ -123,7 +123,8 @@ Sizing guidance:
 - **Overprovision each tier.** A tier whose potential weight exactly equals the threshold escalates the moment any one source fails or dissents. Three weight-1 sources against a threshold of 2 tolerate one outlier; two sources tolerate none.
 - **Prefer model diversity within a tier.** Two copies of the same model mostly vote together, so their combined weight overstates the independence of the "second opinion".
 - **Keep the required weight reachable.** The target tier's threshold must be ≤ the summed weight of all sources in tiers ≤ target, or `quorum.achieved` can never be true.
-- **Pick a cheap, reliable arbiter.** The arbiter is called at least once per `peer_review` call plus once per escalation, and its tokens count toward `tokenUsage`. It can double as a regular peer. If the arbiter's own call fails, the whole evaluation falls back to `arbiterFailed: true` with `certaintyScore: 0` — so give the arbiter role to the source with your most dependable credential.
+- **Let lower tiers be able to win.** A tier can only short-circuit a call if the weight accumulated *through* that tier can reach the target tier's threshold. If it can't, that tier is pure overhead on default calls: its peers are billed, the end-of-tier arbiter rating is billed, and escalation happens regardless. With `{"tier1": 2, "tier2": 3}` over two weight-1 tier-1 sources, a default call can only ever reach weight 2 at tier 1 against a required 3 — so tier 1 never saves anything. Either raise the tier-1 weights, add a tier-1 source, or lower `tier2` so the cheap tier has a path to quorum. A tier that can't win is still useful if you want its answers *in the mix* for the later arbiter pass — just size it knowing that's what you're paying for.
+- **Pick a cheap, reliable arbiter.** The arbiter is called at least once per `peer_review` call plus once per escalation, and its tokens count toward `tokenUsage`. It can double as a regular peer, but note that it then rates its own answer alongside the others — check how much of your threshold that self-rating can supply, and prefer an arbiter that isn't also one of your heaviest voters. If the arbiter's own call fails, the whole evaluation falls back to `arbiterFailed: true` with `certaintyScore: 0` — so give the arbiter role to the source with your most dependable credential.
 
 ### Example: a three-tier stack
 
