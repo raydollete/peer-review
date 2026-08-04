@@ -281,7 +281,13 @@ describe('quorum agreement semantics', () => {
     expect(result.certaintyScore).toBeCloseTo(0.45); // min(1, 2/4) × 0.9
   });
 
-  it('falls back to the highest-weighted successful response when the arbiter is down', async () => {
+  // Was: 'falls back to the highest-weighted successful response when the arbiter
+  // is down'. That behavior is retired. An arbiter outage means no quorum was
+  // ever evaluated, so the highest-weighted source's raw text is precisely the
+  // unvalidated opinion the withholding requirement exists to stop handing back.
+  // The selection still runs (it decides whether ANY response existed at all),
+  // but its prose is no longer observable on a failed quorum.
+  it('withholds the fallback response when the arbiter is down', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'light answer'));
     const b = makeSource('b', 1, 3, answers('b', 'heavy answer'));
     const arbiter = makeArbiter(['transport-error']);
@@ -294,9 +300,13 @@ describe('quorum agreement semantics', () => {
 
     const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
 
-    expect(result.response).toBe('heavy answer');
+    expect(result.response).toBe('');
+    expect(result.responseWithheld).toBe(true);
     expect(result.certaintyScore).toBe(0);
     expect(result.arbiterFailed).toBe(true);
     expect(result.achieved).toBe(false);
+    // Verdict metadata stays complete so the failure is honestly transcribable.
+    expect(result.sources.find((s) => s.name === 'b')?.status).toBe('ok');
+    expect(result.requiredWeight).toBe(4);
   });
 });

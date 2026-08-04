@@ -95,7 +95,18 @@ export class PeerReviewQuorumUseCase {
 
     let reachedTier = targetTier;
     try {
-      for (const tier of tiers.filter((t) => t <= targetTier)) {
+      // `tier` selects review depth and cost — it is NOT a failover barrier. A
+      // miss is outage-shaped (attainable < required: missing weight belongs to
+      // an errored source, so no re-evaluation can clear it) and escalates past
+      // the ceiling to restore capacity; or disagreement-shaped (everyone
+      // answered, they disagreed), which is revisable and holds the ceiling.
+      // requiredWeight is HELD at the requested tier's threshold throughout —
+      // escalation restores the capacity to reach the caller's bar, it never
+      // raises that bar. See design.md § "Review Feedback" point 2.
+      for (const tier of tiers) {
+        if (tier > targetTier && this.attainableWeight(state) >= requiredWeight) {
+          break;
+        }
         reachedTier = tier;
         await this.runTier(tier, input, state, controller, requiredWeight);
         if (state.achieved || state.deadlineHit) {
@@ -196,12 +207,22 @@ export class PeerReviewQuorumUseCase {
     }
   }
 
+  /**
+   * Summed weight of sources that have SETTLED successfully.
+   *
+   * Counts only settled successes — never pending or in-flight sources — so a
+   * slow peer is not mistaken for a dead one. Below requiredWeight between tiers
+   * means the miss is an outage (escalate); at or above it means disagreement.
+   */
+  private attainableWeight(state: RunState): number {
+    return state.successes.reduce((sum, s) => sum + s.source.weight, 0);
+  }
+
   private quorumPossible(state: RunState, requiredWeight: number): boolean {
     if (state.successes.length <= state.evaluatedCount) {
       return false;
     }
-    const potential = state.successes.reduce((sum, s) => sum + s.source.weight, 0);
-    return potential >= requiredWeight;
+    return this.attainableWeight(state) >= requiredWeight;
   }
 
   private record(state: RunState, settled: Settled): void {
@@ -296,7 +317,11 @@ export class PeerReviewQuorumUseCase {
         .filter((r) => r.agreement >= AGREEMENT_THRESHOLD)
         .map((r) => r.agreement);
       return ok({
-        response: state.lastEval.consensus,
+        // Withhold prose no quorum validated. `response` stays a string ('') so
+        // clients reading it unconditionally are unaffected; the metadata below
+        // is returned in full so the verdict is still honestly transcribable.
+        response: state.achieved ? state.lastEval.consensus : '',
+        ...(state.achieved ? {} : { responseWithheld: true as const }),
         certaintyScore: computeCertainty(state.agreeingWeight, requiredWeight, agreeingRatings),
         // Last evaluation's caller rating wins across tier re-evaluations.
         ...(input.callerAnswer !== undefined
@@ -311,7 +336,10 @@ export class PeerReviewQuorumUseCase {
       return err(new ExternalServiceError('No peer source produced a response', 'peer-review'));
     }
     return ok({
-      response: top.response.text,
+      // Same withholding on the fallback path: an unachieved quorum must not hand
+      // back a single peer's raw text either — that is prose no quorum validated.
+      response: state.achieved ? top.response.text : '',
+      ...(state.achieved ? {} : { responseWithheld: true as const }),
       certaintyScore: 0,
       ...(state.arbiterFailed ? { arbiterFailed: true } : {}),
       // No trusted evaluation on this path — a supplied caller answer is unrated.

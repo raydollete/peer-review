@@ -9,6 +9,10 @@ import {
 
 export interface PeerReviewResponseData {
   readonly response: string;
+  /** Set only on a failed quorum, where the synthesized consensus is withheld and
+   * `response` is ''. Key omitted entirely otherwise, so an achieved-quorum
+   * envelope stays byte-identical for existing clients. */
+  readonly responseWithheld?: true;
   readonly certaintyScore: number;
   /** Present only when the call supplied callerAnswer; null = supplied but unrated. */
   readonly callerAgreement?: number | null;
@@ -49,6 +53,7 @@ export class PeerReviewController {
     const quorum = result.value;
     return successResponse({
       response: quorum.response,
+      ...(quorum.responseWithheld === true ? { responseWithheld: true as const } : {}),
       certaintyScore: quorum.certaintyScore,
       // Key omitted (not null) when no callerAnswer was supplied — the envelope
       // stays byte-identical for existing clients.

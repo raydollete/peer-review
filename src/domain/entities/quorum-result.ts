@@ -19,6 +19,13 @@ export interface QuorumResult {
   readonly requiredWeight: number;
   readonly agreeingWeight: number;
   readonly arbiterFailed?: boolean;
+  /** Set only when the quorum was not achieved and the synthesized consensus (or
+   * representative fallback) prose has therefore been withheld: text no quorum
+   * validated is unvalidated opinion, and returning it invites a caller to fold
+   * un-quorum'd suggestions into its own reasoning. `response` stays a string —
+   * it carries '' on a withheld result — so the shape is unchanged for clients
+   * that read it unconditionally. Verdict metadata is always returned in full. */
+  readonly responseWithheld?: true;
   /** Arbiter rating of the caller's own answer against the consensus, in [0, 1].
    * Present only when the call supplied a callerAnswer; null = supplied but unrated.
    * Carries zero quorum weight. */

@@ -95,7 +95,10 @@ describe('PeerReviewQuorumUseCase', () => {
 
     expect(result.achieved).toBe(false);
     expect(result.certaintyScore).toBe(0);
-    expect(result.response).toBe('fast answer');
+    // Quorum not achieved, so the prose is withheld: '' plus the signal. The
+    // partial result is still fully transcribable from the metadata below.
+    expect(result.response).toBe('');
+    expect(result.responseWithheld).toBe(true);
     expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
     expect(result.sources.find((s) => s.name === 'b')?.status).toBe('error');
     expect(arbiter.calls).toHaveLength(0);
@@ -140,6 +143,96 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(c.calls).toHaveLength(0);
   });
 
+  it('disagreement at the caller ceiling does NOT escalate past it', async () => {
+    // Both tier-1 sources answer — attainable weight (2) meets requiredWeight (2)
+    // — but the arbiter rates them as disagreeing. The miss is revisable by the
+    // caller, so the ceiling holds and keeps its cost-control meaning.
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const b = makeSource('b', 1, 1, answers('b', 'y'));
+    const c = makeSource('c', 2, 2, answers('c', 'z'));
+    const arbiter = makeArbiter([{ a: 0.2, b: 0.2 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, c],
+      arbiter,
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q', tier: 1 }))._unsafeUnwrap();
+
+    expect(result.achieved).toBe(false);
+    expect(c.calls).toHaveLength(0);
+    expect(result.tier).toBe(1);
+  });
+
+  it('an outage-shaped miss escalates PAST the caller ceiling', async () => {
+    // 'b' errors, so attainable weight (1) is below requiredWeight (2) and no
+    // re-evaluation over tier 1 can ever clear it. The tier-2 source must be
+    // consulted rather than returning an unattainable failure.
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const b = makeSource('b', 1, 1, 'transport-error');
+    const c = makeSource('c', 2, 2, answers('c', 'x'));
+    const arbiter = makeArbiter([{ a: 1 }, { a: 1, c: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, c],
+      arbiter,
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q', tier: 1 }))._unsafeUnwrap();
+
+    expect(c.calls).toHaveLength(1);
+    expect(result.tier).toBe(2);
+    // The correction from external review (caller agreement 0.6): escalation
+    // restores the CAPACITY to reach the caller's bar — it must not RAISE the
+    // bar. requiredWeight stays tier 1's 2, never tier 2's 4. The draft design
+    // re-derived it, and this assertion is what would have caught that.
+    expect(result.requiredWeight).toBe(2);
+    expect(result.achieved).toBe(true);
+  });
+
+  it('withholds prose when the quorum is unattainable even at the highest tier', async () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const b = makeSource('b', 1, 1, 'transport-error');
+    const c = makeSource('c', 2, 2, 'transport-error');
+    const arbiter = makeArbiter([{ a: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, c],
+      arbiter,
+      thresholds: { 1: 4, 2: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q', tier: 1 }))._unsafeUnwrap();
+
+    expect(result.achieved).toBe(false);
+    expect(result.response).toBe('');
+    expect(result.responseWithheld).toBe(true);
+    // Metadata complete, so the verdict is still honestly transcribable.
+    expect(result.requiredWeight).toBe(4);
+    expect(result.sources.find((s) => s.name === 'b')?.status).toBe('error');
+    expect(result.sources.find((s) => s.name === 'c')?.status).toBe('error');
+  });
+
+  it('an achieved quorum still returns its prose and carries no withheld flag', async () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const b = makeSource('b', 1, 1, answers('b', 'x'));
+    const arbiter = makeArbiter([{ a: 1, b: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(result.achieved).toBe(true);
+    expect(result.response).not.toBe('');
+    expect(result.responseWithheld).toBeUndefined();
+  });
+
   it('rejects a tier without a configured threshold', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'x'));
     const useCase = new PeerReviewQuorumUseCase({
@@ -170,10 +263,13 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(arbiter.calls).toHaveLength(2);
     expect(result.achieved).toBe(false);
     expect(result.arbiterFailed).toBe(true);
-    // D7: stale tier-1 consensus must not surface with non-zero certainty —
-    // fall back to the highest-weighted successful source's answer.
+    // D7: stale tier-1 consensus must not surface with non-zero certainty.
     expect(result.certaintyScore).toBe(0);
-    expect(result.response).toBe('Paris');
+    // The fallback prose is withheld too — the quorum was not achieved, so the
+    // highest-weighted source's raw answer is exactly the unvalidated opinion
+    // this must not hand back. Metadata stays complete.
+    expect(result.response).toBe('');
+    expect(result.responseWithheld).toBe(true);
     // Stale ratings remain itemized for transparency.
     expect(result.sources.find((s) => s.name === 'a')?.agreement).toBe(0.9);
   });
