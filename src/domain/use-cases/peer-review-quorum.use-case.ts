@@ -18,6 +18,7 @@ import {
   evaluateAgreement,
   type AgreementEvaluation,
 } from './agreement.js';
+import { markFailed, markOk, seedReport, type MutableReport } from './source-reports.js';
 import type { ILogger } from '../../shared/logger/index.js';
 
 export interface QuorumInput {
@@ -34,14 +35,6 @@ export interface QuorumDeps {
   readonly thresholds: Readonly<Record<number, number>>;
   readonly deadlineMs: number;
   readonly logger?: Pick<ILogger, 'warn'> | undefined;
-}
-
-interface MutableReport {
-  name: string;
-  model: string;
-  status: 'ok' | 'error' | 'unavailable';
-  weight: number;
-  agreement: number | null;
 }
 
 interface RunState {
@@ -129,14 +122,7 @@ export class PeerReviewQuorumUseCase {
     const pending = new Map<number, Promise<{ key: number; settled: Settled }>>();
     let nextKey = 0;
     for (const source of this.deps.sources.filter((s) => s.tier === tier)) {
-      const report: MutableReport = {
-        name: source.name,
-        model: source.model,
-        status: source.available ? 'error' : 'unavailable',
-        weight: source.weight,
-        agreement: null,
-      };
-      state.reports.set(source.name, report);
+      state.reports.set(source.name, seedReport(source));
       if (!source.available) {
         continue;
       }
@@ -231,15 +217,14 @@ export class PeerReviewQuorumUseCase {
       return;
     }
     if (settled.result.isOk()) {
-      report.status = 'ok';
+      markOk(report);
       state.successes.push({ source: settled.source, response: settled.result.value });
       const usage = settled.result.value.usage;
       state.usage.promptTokens += usage.promptTokens;
       state.usage.completionTokens += usage.completionTokens;
       state.usage.totalTokens += usage.totalTokens;
     } else {
-      report.status =
-        settled.result.error instanceof ConfigurationError ? 'unavailable' : 'error';
+      markFailed(report, settled.result.error);
       this.deps.logger?.warn('Peer failed during quorum', {
         source: settled.source.name,
         status: report.status,

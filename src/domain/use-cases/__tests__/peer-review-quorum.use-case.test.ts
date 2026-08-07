@@ -29,6 +29,45 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(result.certaintyScore).toBeGreaterThan(0);
   });
 
+  it('carries the failure reason into the verdict for every non-ok source', async () => {
+    const broken = makeSource('broken', 1, 2, async () =>
+      err(new ExternalServiceError('Peer returned no usable text (finish_reason=length)', 'broken')),
+    );
+    const nokey = makeSource('nokey', 1, 2, answers('nokey', 'unused'), false);
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Paris.'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [broken, nokey, a, b],
+      arbiter: makeArbiter([{ a: 0.9, b: 0.8 }]),
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    // A bare status is undiagnosable — the caller only ever sees this envelope.
+    expect(result.sources.find((s) => s.name === 'broken')?.error).toContain('finish_reason=length');
+    expect(result.sources.find((s) => s.name === 'nokey')?.status).toBe('unavailable');
+    expect(result.sources.find((s) => s.name === 'nokey')?.error).toContain('Credential');
+    expect(result.sources.find((s) => s.name === 'a')?.error).toBeUndefined();
+  });
+
+  it('explains a source that never settled before the run ended', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Paris.'));
+    const slow = makeSource('slow', 1, 1, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, slow],
+      arbiter: makeArbiter([{ a: 0.9, b: 0.9 }]),
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(result.sources.find((s) => s.name === 'slow')?.error).toBeDefined();
+  });
+
   it('tier-1 quorum stops escalation — no tier-2 source is called', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'Paris'));
     const b = makeSource('b', 1, 2, answers('b', 'Paris.'));

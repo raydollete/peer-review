@@ -80,6 +80,12 @@ describe('peer config', () => {
     expect(() => parsePeerConfig(raw)).toThrow(ConfigurationError);
   });
 
+  it('strips a trailing slash from baseUrl so adapters cannot build a double slash', () => {
+    const raw = clone();
+    raw.sources[0]!['baseUrl'] = 'https://openrouter.ai/api/v1/';
+    expect(parsePeerConfig(raw).sources[0]!.baseUrl).toBe('https://openrouter.ai/api/v1');
+  });
+
   it('fails fast on an unknown arbiter name', () => {
     const raw = clone();
     (raw as Record<string, unknown>)['arbiter'] = 'nobody';

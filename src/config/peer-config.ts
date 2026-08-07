@@ -6,7 +6,12 @@ import { ConfigurationError } from '../shared/errors/index.js';
 const SourceSchema = z.object({
   name: z.string().min(1),
   apiType: z.enum(['openai', 'anthropic']),
-  baseUrl: z.string().url(),
+  // Adapters append "/chat/completions" (or "/v1/messages"), so a trailing
+  // slash here would produce a double slash — OpenRouter answers those with 404.
+  baseUrl: z
+    .string()
+    .url()
+    .transform((url) => url.replace(/\/+$/, '')),
   model: z.string().min(1),
   apiKeyEnv: z.string().min(1).optional(),
   apiKeyCommand: z.string().min(1).optional(),

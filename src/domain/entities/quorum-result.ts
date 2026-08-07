@@ -9,6 +9,9 @@ export interface QuorumSourceReport {
   readonly weight: number;
   /** Arbiter agreement rating in [0, 1]; null when the source produced no rated response. */
   readonly agreement: number | null;
+  /** Why a non-ok source failed. Absent when status is "ok" — a bare "error"
+   * status is undiagnosable from the caller side, which only sees this envelope. */
+  readonly error?: string | undefined;
 }
 
 export interface QuorumResult {
