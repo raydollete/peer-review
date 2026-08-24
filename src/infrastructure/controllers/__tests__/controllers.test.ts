@@ -95,6 +95,31 @@ describe('PeerReviewController', () => {
     expect(withTemp.success).toBe(false);
     expect(withTemp.error?.code).toBe('VALIDATION_ERROR');
   });
+
+  it('parses callerSource and skips that source, itemizing it as "skipped"', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+    const quorum = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter: makeArbiter([{ a: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = await new PeerReviewController(quorum).handle({
+      prompt: 'q',
+      callerSource: 'b',
+    });
+    expect(result.success).toBe(true);
+    expect(b.calls).toHaveLength(0);
+    expect(result.data?.quorum.sources.find((s) => s.name === 'b')?.status).toBe('skipped');
+  });
+
+  it('rejects an empty callerSource with VALIDATION_ERROR', async () => {
+    const { peerReview } = buildControllers();
+    const result = await peerReview.handle({ prompt: 'q', callerSource: '' });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('VALIDATION_ERROR');
+  });
 });
 
 describe('QueryPeerController', () => {

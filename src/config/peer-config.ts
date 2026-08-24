@@ -22,6 +22,10 @@ const SourceSchema = z.object({
   // (hidden thinking is billed against max_tokens before the answer).
   timeoutMs: z.number().int().positive().optional(),
   maxOutputTokens: z.number().int().positive().optional(),
+  // Marks a source served by the local inference backend. When a caller is
+  // itself running on that backend (PEER_REVIEW_SKIP_LOCAL), consulting it is
+  // self-contention, so it is skipped for the request. Locality, not model id.
+  local: z.boolean().optional(),
 });
 
 const TIER_KEY_PATTERN = /^(?:tier)?([0-9]+)$/;

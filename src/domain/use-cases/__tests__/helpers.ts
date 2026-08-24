@@ -26,6 +26,7 @@ export function makeSource(
   weight: number,
   complete: CompleteFn,
   available = true,
+  local = false,
 ): TestSource {
   const calls: PeerRequest[] = [];
   const client: IPeerClient = {
@@ -36,11 +37,38 @@ export function makeSource(
     countTokens: async () =>
       ok({ totalTokens: 1, model: `${name}-model`, method: 'estimate' as const }),
   };
-  return { name, model: `${name}-model`, apiType: 'generic', weight, tier, available, client, calls };
+  return {
+    name,
+    model: `${name}-model`,
+    apiType: 'generic',
+    weight,
+    tier,
+    available,
+    local,
+    client,
+    calls,
+  };
 }
 
 export function answers(name: string, text: string): CompleteFn {
   return async () => ok(peerResponse(name, text));
+}
+
+/**
+ * Slow-but-alive: resolves SUCCESS after `ms`, independent of abort — the third
+ * state (`resolvesOnAbortOnly` = dies on abort; `answers` = instant success)
+ * that a contended-but-healthy backend occupies. The timer is unref'd so a run
+ * that abandons this source (tier budget elapsed) never keeps the test process
+ * alive waiting for it.
+ */
+export function resolvesAfterDelay(ms: number, text = 'slow answer'): CompleteFn {
+  return () =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolve(ok(peerResponse('slow', text)));
+      }, ms);
+      (timer as { unref?: () => void }).unref?.();
+    });
 }
 
 /** Resolves with a TimeoutError only once the request signal aborts. */

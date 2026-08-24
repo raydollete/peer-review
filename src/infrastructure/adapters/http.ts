@@ -33,6 +33,55 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Resolves as soon as `signal` aborts (or immediately if already aborted), so a
+ * backoff sleep can be raced against orchestrator cancellation instead of adding
+ * non-abortable latency past the deadline. */
+function abortPromise(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    signal.addEventListener('abort', () => resolve(), { once: true });
+  });
+}
+
+/** Honest attribution: an external (orchestrator) abort is cancellation, never a
+ * source-attributed timeout — a healthy-but-contended source is not scapegoated. */
+function cancelledError(serviceName: string): DomainError {
+  return new ExternalServiceError(
+    `Request to "${serviceName}" was cancelled by the orchestrator`,
+    serviceName,
+  );
+}
+
+/**
+ * Wait out a retryable-status backoff, or bail. Returns an error to end the loop
+ * (already cancelled, the sleep would breach the deadline, or cancellation fired
+ * mid-sleep), or undefined to retry. The sleep is raced against the external
+ * signal so a contended backend's 429/503 backoff adds no non-abortable latency.
+ */
+async function backoff(
+  cfg: PostJsonConfig,
+  sleepFn: (ms: number) => Promise<void>,
+  delayMs: number,
+  deadline: number,
+  status: number,
+): Promise<DomainError | undefined> {
+  if (cfg.signal?.aborted === true) {
+    return cancelledError(cfg.serviceName);
+  }
+  if (Date.now() + delayMs >= deadline) {
+    return mapStatusToError(status, cfg.serviceName);
+  }
+  if (cfg.signal === undefined) {
+    await sleepFn(delayMs);
+    return undefined;
+  }
+  await Promise.race([sleepFn(delayMs), abortPromise(cfg.signal)]);
+  return cfg.signal.aborted ? cancelledError(cfg.serviceName) : undefined;
+}
+
 /** Errors are mapped from HTTP status codes only — never from message text (design D6). */
 export function mapStatusToError(status: number, serviceName: string): DomainError {
   if (status === 429) {
@@ -92,6 +141,14 @@ async function performFetch(
     return ok(response);
   } catch (error) {
     if (isAbortError(error)) {
+      // Honest attribution: an external (orchestrator) signal aborting the call
+      // is cancellation, NOT this source's own timeout. Only the per-request
+      // AbortSignal.timeout firing scapegoats the source with a TimeoutError, so
+      // a healthy-but-contended source the orchestrator moved on from is never
+      // mislabeled as having timed out on its own.
+      if (cfg.signal?.aborted === true) {
+        return err(cancelledError(cfg.serviceName));
+      }
       return err(new TimeoutError(`Request to "${cfg.serviceName}" was aborted`, cfg.timeoutMs));
     }
     return err(new ExternalServiceError(`Network error: ${String(error)}`, cfg.serviceName));
@@ -144,11 +201,11 @@ export async function postJson(
 
     if (RETRYABLE_STATUSES.has(response.status) && state.rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
       const delayMs = BACKOFF_BASE_MS * 2 ** state.rateLimitRetries * (1 + random());
-      if (Date.now() + delayMs >= deadline) {
-        return err(mapStatusToError(response.status, cfg.serviceName));
-      }
       state.rateLimitRetries += 1;
-      await sleepFn(delayMs);
+      const failure = await backoff(cfg, sleepFn, delayMs, deadline, response.status);
+      if (failure !== undefined) {
+        return err(failure);
+      }
       continue;
     }
 

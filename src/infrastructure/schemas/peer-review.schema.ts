@@ -15,6 +15,7 @@ export const PeerReviewInputSchema = z
     history: HistorySchema.optional(),
     tier: z.number().int().positive().optional(),
     callerAnswer: z.string().min(1).max(100000).optional(),
+    callerSource: z.string().min(1).optional(),
   })
   .strict();
 

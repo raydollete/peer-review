@@ -39,6 +39,14 @@ describe('peer config', () => {
     expect(config.sources).toHaveLength(2);
   });
 
+  it('parses the optional per-source local flag, defaulting undefined', () => {
+    const raw = clone();
+    raw.sources[0]!['local'] = true;
+    const config = parsePeerConfig(raw);
+    expect(config.sources[0]?.local).toBe(true);
+    expect(config.sources[1]?.local).toBeUndefined();
+  });
+
   it('parses optional per-source timeoutMs and maxOutputTokens', () => {
     const raw = clone();
     raw.sources[0]!['timeoutMs'] = 180000;
@@ -152,5 +160,61 @@ describe('env config', () => {
     const { loadEnvConfig } = await import('../env.config.js');
     expect(loadEnvConfig({ PEER_TIMEOUT_MS: '5000' }).timeoutMs).toBe(5000);
     expect(() => loadEnvConfig({ PEER_TIMEOUT_MS: 'soon' })).toThrow(ConfigurationError);
+  });
+
+  it('parses PEER_REVIEW_SKIP_LOCAL as a boolean, defaulting false', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    expect(loadEnvConfig({}).skipLocal).toBe(false);
+    expect(loadEnvConfig({ PEER_REVIEW_SKIP_LOCAL: 'true' }).skipLocal).toBe(true);
+    expect(loadEnvConfig({ PEER_REVIEW_SKIP_LOCAL: '1' }).skipLocal).toBe(true);
+    expect(loadEnvConfig({ PEER_REVIEW_SKIP_LOCAL: 'false' }).skipLocal).toBe(false);
+    expect(loadEnvConfig({ PEER_REVIEW_SKIP_LOCAL: '0' }).skipLocal).toBe(false);
+    expect(() => loadEnvConfig({ PEER_REVIEW_SKIP_LOCAL: 'yes' })).toThrow(ConfigurationError);
+  });
+});
+
+describe('timeout-vs-deadline startup guard', () => {
+  async function validate(rawConfig: unknown, env: Record<string, string>): Promise<void> {
+    const { parsePeerConfig, loadEnvConfig } = await import('../index.js');
+    const { validateTimeoutsAgainstDeadline } = await import('../validate-timeouts.js');
+    validateTimeoutsAgainstDeadline(parsePeerConfig(rawConfig), loadEnvConfig(env));
+  }
+
+  it('throws when the largest source timeout plus arbiter cannot fit the deadline', async () => {
+    const config = clone();
+    // beta is NOT the arbiter (alpha is), so this exercises source + arbiter as
+    // distinct terms: 400000 (beta) + 120000 (alpha, default) = 520000.
+    config.sources[1]!['timeoutMs'] = 400000;
+    await expect(
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
+    ).rejects.toThrow(ConfigurationError);
+  });
+
+  it('names the offending timeout, the arbiter timeout, and the deadline', async () => {
+    const config = clone();
+    config.sources[1]!['timeoutMs'] = 400000;
+    await expect(
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
+    ).rejects.toThrow(/400000.*120000.*480000/s);
+  });
+
+  it('passes when one wave plus arbiter fits within the deadline', async () => {
+    const config = clone();
+    config.sources[1]!['timeoutMs'] = 200000; // 200000 + arbiter 120000 = 320000 < 480000
+    await expect(
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('accepts the shipped default config under default env', async () => {
+    const { loadPeerConfig, loadEnvConfig } = await import('../index.js');
+    const { validateTimeoutsAgainstDeadline } = await import('../validate-timeouts.js');
+    // max source 300000 (kimi-k3) + arbiter 120000 (gemini-flash default) = 420000 < 480000
+    expect(() =>
+      validateTimeoutsAgainstDeadline(
+        loadPeerConfig('./peer-review.config.json'),
+        loadEnvConfig({}),
+      ),
+    ).not.toThrow();
   });
 });

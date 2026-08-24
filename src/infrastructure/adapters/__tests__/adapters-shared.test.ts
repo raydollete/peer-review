@@ -106,7 +106,7 @@ describe('shared adapter HTTP behavior', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('maps an aborted request to TimeoutError', async () => {
+  it('maps an orchestrator-cancelled request to a cancellation error, not the source own timeout', async () => {
     const fetchMock = jest.fn<typeof fetch>().mockImplementation((_url, init) => {
       return new Promise((_resolve, reject) => {
         const fail = (): void =>
@@ -122,7 +122,43 @@ describe('shared adapter HTTP behavior', () => {
     const pending = call(fetchMock, undefined, 5000, controller.signal);
     controller.abort();
     const result = await pending;
-    expect(result._unsafeUnwrapErr()).toBeInstanceOf(TimeoutError);
+    const error = result._unsafeUnwrapErr();
+    // Honest attribution (E1): an external (orchestrator) abort is cancellation —
+    // NOT a TimeoutError blamed on this healthy-but-contended source. Only the
+    // per-request timeout firing (next test) yields a source-attributed timeout.
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error).not.toBeInstanceOf(TimeoutError);
+    expect(error.message).toContain('cancelled');
+  });
+
+  it('aborts a 429 backoff promptly on external cancellation instead of sleeping it out', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse({}, 429));
+    // A sleep that never resolves: only prompt cancellation can end the run, so a
+    // passing (non-hanging) test proves the backoff races the external signal.
+    const neverSleep = jest
+      .fn<(ms: number) => Promise<void>>()
+      .mockImplementation(() => new Promise<void>(() => undefined));
+    const controller = new AbortController();
+    const pending = postJson(
+      {
+        url: 'https://api.example.com/endpoint',
+        body: { q: 1 },
+        headers: (credential) => ({ authorization: `Bearer ${credential}` }),
+        credentialProvider: new StubCredentialProvider('key-1'),
+        serviceName: 'test-source',
+        timeoutMs: 5000,
+        signal: controller.signal,
+      },
+      { fetchFn: fetchMock, sleepFn: neverSleep, random: () => 0 },
+    );
+    // Let execution reach the backoff race, then cancel.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+    const error = (await pending)._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error.message).toContain('cancelled');
+    expect(neverSleep).toHaveBeenCalledTimes(1); // entered backoff...
+    expect(fetchMock).toHaveBeenCalledTimes(1); // ...but never retried past the abort
   });
 
   it('maps a per-source timeout to TimeoutError', async () => {

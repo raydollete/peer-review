@@ -1,24 +1,14 @@
-import { ok, err, type Result } from 'neverthrow';
-import type {
-  HistoryTurn,
-  PeerResponse,
-  QuorumResult,
-  QuorumSourceReport,
-} from '../entities/index.js';
+import { err, type Result } from 'neverthrow';
+import type { HistoryTurn, PeerResponse, QuorumResult } from '../entities/index.js';
 import type { PeerSource } from '../ports/index.js';
-import {
-  ConfigurationError,
-  ExternalServiceError,
-  ValidationError,
-  type DomainError,
-} from '../errors/index.js';
-import {
-  AGREEMENT_THRESHOLD,
-  computeCertainty,
-  evaluateAgreement,
-  type AgreementEvaluation,
-} from './agreement.js';
-import { markFailed, markOk, seedReport, type MutableReport } from './source-reports.js';
+import { ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
+import type { DomainError } from '../errors/index.js';
+import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
+import type { AgreementEvaluation } from './agreement.js';
+import { markFailed, markOk, markSkipped, seedReport } from './source-reports.js';
+import type { MutableReport } from './source-reports.js';
+import { computeTierBudget, markPendingOutage, signalAbortPromise } from './tier-budget.js';
+import { assembleResult } from './quorum-assemble.js';
 import type { ILogger } from '../../shared/logger/index.js';
 
 export interface QuorumInput {
@@ -27,6 +17,10 @@ export interface QuorumInput {
   readonly tier?: number | undefined;
   /** The calling agent's own answer — arbiter-rated only, never sent to peers. */
   readonly callerAnswer?: string | undefined;
+  /** A configured source the caller itself is — skipped as a redundant peer for
+   * this request (never called; itemized as `status: 'skipped'`). Unknown name =
+   * logged no-op. Independent of `callerAnswer`. */
+  readonly callerSource?: string | undefined;
 }
 
 export interface QuorumDeps {
@@ -34,10 +28,19 @@ export interface QuorumDeps {
   readonly arbiter: PeerSource;
   readonly thresholds: Readonly<Record<number, number>>;
   readonly deadlineMs: number;
+  /** The arbiter's effective request timeout, reserved out of each tier's budget
+   * so an evaluation always fits before the outer wall. Defaults to 0 (no
+   * reserve) when unset — production wires the arbiter source's real timeout. */
+  readonly arbiterTimeoutMs?: number | undefined;
+  /** When true, every source flagged `local` is excluded from the quorum for the
+   * request — the class-wide sibling of a per-request `callerSource` skip. Set
+   * per-harness via PEER_REVIEW_SKIP_LOCAL when the caller runs on the local
+   * backend, so it does not contend with itself. */
+  readonly skipLocal?: boolean | undefined;
   readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
 
-interface RunState {
+export interface RunState {
   readonly reports: Map<string, MutableReport>;
   readonly successes: Array<{ source: PeerSource; response: PeerResponse }>;
   readonly usage: { promptTokens: number; completionTokens: number; totalTokens: number };
@@ -69,6 +72,17 @@ export class PeerReviewQuorumUseCase {
       return err(new ValidationError(`No threshold configured for tier ${targetTier}`));
     }
 
+    // A3: an unknown callerSource is a logged no-op, never a crash — the caller
+    // may be pointed at a differently-configured server than it assumes.
+    if (
+      input.callerSource !== undefined &&
+      !this.deps.sources.some((s) => s.name === input.callerSource)
+    ) {
+      this.deps.logger?.warn('callerSource names no configured source; ignoring', {
+        callerSource: input.callerSource,
+      });
+    }
+
     const state: RunState = {
       reports: new Map(),
       successes: [],
@@ -81,6 +95,7 @@ export class PeerReviewQuorumUseCase {
       deadlineHit: false,
     };
     const controller = new AbortController();
+    const start = Date.now();
     const timer = setTimeout(() => {
       state.deadlineHit = true;
       controller.abort();
@@ -88,29 +103,58 @@ export class PeerReviewQuorumUseCase {
 
     let reachedTier = targetTier;
     try {
-      // `tier` selects review depth and cost — it is NOT a failover barrier. A
-      // miss is outage-shaped (attainable < required: missing weight belongs to
-      // an errored source, so no re-evaluation can clear it) and escalates past
-      // the ceiling to restore capacity; or disagreement-shaped (everyone
-      // answered, they disagreed), which is revisable and holds the ceiling.
-      // requiredWeight is HELD at the requested tier's threshold throughout —
-      // escalation restores the capacity to reach the caller's bar, it never
-      // raises that bar. See design.md § "Review Feedback" point 2.
-      for (const tier of tiers) {
-        if (tier > targetTier && this.attainableWeight(state) >= requiredWeight) {
-          break;
-        }
-        reachedTier = tier;
-        await this.runTier(tier, input, state, controller, requiredWeight);
-        if (state.achieved || state.deadlineHit) {
-          break;
-        }
-      }
+      reachedTier = await this.runTiers(tiers, targetTier, requiredWeight, input, state, controller, start);
     } finally {
       clearTimeout(timer);
       controller.abort();
     }
-    return this.assemble(input, state, reachedTier, requiredWeight);
+    return assembleResult(input, state, reachedTier, requiredWeight);
+  }
+
+  /**
+   * Walk the tiers in order. `tier` selects review depth and cost — it is NOT a
+   * failover barrier. requiredWeight is HELD at the requested tier's threshold
+   * throughout: escalation restores the capacity to reach the caller's bar, it
+   * never raises that bar (see design.md § "Review Feedback" point 2).
+   */
+  private async runTiers(
+    tiers: readonly number[],
+    targetTier: number,
+    requiredWeight: number,
+    input: QuorumInput,
+    state: RunState,
+    controller: AbortController,
+    start: number,
+  ): Promise<number> {
+    let reachedTier = targetTier;
+    for (const tier of tiers) {
+      // Hold the ceiling on a DISAGREEMENT-shaped miss (everyone answered,
+      // attainable weight already meets the bar — revisable, no escalation).
+      // But an arbiter that could not render a verdict (arbiterFailed) is a
+      // recoverable outage, not disagreement: permit escalation to a fresh
+      // arbiter attempt at the next tier instead of breaking here (C1).
+      if (
+        tier > targetTier &&
+        this.attainableWeight(state) >= requiredWeight &&
+        !(state.arbiterFailed && !state.achieved)
+      ) {
+        break;
+      }
+      reachedTier = tier;
+      const tiersRemaining = tiers.length - tiers.indexOf(tier);
+      const tierBudget = computeTierBudget(
+        this.deps.deadlineMs,
+        Date.now() - start,
+        tiersRemaining,
+        this.deps.arbiterTimeoutMs ?? 0,
+      );
+      const tierSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(tierBudget)]);
+      await this.runTier(tier, input, state, controller, requiredWeight, tierSignal);
+      if (state.achieved || state.deadlineHit) {
+        break;
+      }
+    }
+    return reachedTier;
   }
 
   private launchTier(
@@ -118,16 +162,32 @@ export class PeerReviewQuorumUseCase {
     input: QuorumInput,
     state: RunState,
     signal: AbortSignal,
-  ): Map<number, Promise<{ key: number; settled: Settled }>> {
+  ): {
+    pending: Map<number, Promise<{ key: number; settled: Settled }>>;
+    inflight: Map<number, PeerSource>;
+  } {
     const pending = new Map<number, Promise<{ key: number; settled: Settled }>>();
+    const inflight = new Map<number, PeerSource>();
     let nextKey = 0;
     for (const source of this.deps.sources.filter((s) => s.tier === tier)) {
-      state.reports.set(source.name, seedReport(source));
+      const report = seedReport(source);
+      state.reports.set(source.name, report);
+      // Excluded for this request — skip it as a redundant peer (never launch),
+      // mirroring the `!source.available` skip but with a distinct, transparent
+      // status so the exclusion shows in `sources[]`. Two independent triggers,
+      // applied as a union: the caller declared it IS this source
+      // (`callerSource`), or the caller is local and this source is local
+      // (`skipLocal`). Either alone suffices.
+      if (source.name === input.callerSource || (this.deps.skipLocal === true && source.local === true)) {
+        markSkipped(report);
+        continue;
+      }
       if (!source.available) {
         continue;
       }
       const key = nextKey;
       nextKey += 1;
+      inflight.set(key, source);
       pending.set(
         key,
         source.client
@@ -138,7 +198,7 @@ export class PeerReviewQuorumUseCase {
           .then((result) => ({ key, settled: { source, result } })),
       );
     }
-    return pending;
+    return { pending, inflight };
   }
 
   private async runTier(
@@ -147,21 +207,42 @@ export class PeerReviewQuorumUseCase {
     state: RunState,
     controller: AbortController,
     requiredWeight: number,
+    tierSignal: AbortSignal,
   ): Promise<void> {
-    const pending = this.launchTier(tier, input, state, controller.signal);
+    const { pending, inflight } = this.launchTier(tier, input, state, tierSignal);
+
+    // Resolves when the tier signal aborts — either the global wall (terminal)
+    // or this tier's own budget elapsing (non-terminal → escalate). One listener
+    // for the whole tier; the runtime owns its cleanup.
+    const tierAborted = Symbol('tier-signal-aborted');
+    const abortRace = signalAbortPromise(tierSignal, tierAborted);
 
     while (pending.size > 0) {
-      const { key, settled } = await Promise.race(pending.values());
-      pending.delete(key);
-      this.record(state, settled);
+      const winner = await Promise.race<{ key: number; settled: Settled } | typeof tierAborted>([
+        ...pending.values(),
+        abortRace,
+      ]);
+      if (winner === tierAborted) {
+        // Global wall hit → terminal: leave stragglers on their seeded "no
+        // response recorded" report, exactly as before. Tier budget hit (global
+        // NOT hit) → mark the still-in-flight sources outage-shaped so their
+        // weight is unattainable within budget, then return to escalate.
+        if (!state.deadlineHit) {
+          markPendingOutage(inflight, state.reports);
+        }
+        return;
+      }
+      pending.delete(winner.key);
+      inflight.delete(winner.key);
+      this.record(state, winner.settled);
       // Consume every already-settled peer before evaluating, so a same-tick
       // sibling response is never discarded by an early-abort.
-      await this.drainSettled(pending, state);
+      await this.drainSettled(pending, inflight, state);
       if (state.deadlineHit) {
         return;
       }
       if (!state.achieved && pending.size > 0 && this.quorumPossible(state, requiredWeight)) {
-        await this.evaluate(input, state, controller.signal, requiredWeight);
+        await this.evaluate(input, state, tierSignal, requiredWeight);
         if (state.achieved) {
           // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
           controller.abort();
@@ -171,12 +252,13 @@ export class PeerReviewQuorumUseCase {
     }
 
     if (!state.achieved && !state.deadlineHit && state.successes.length > state.evaluatedCount) {
-      await this.evaluate(input, state, controller.signal, requiredWeight);
+      await this.evaluate(input, state, tierSignal, requiredWeight);
     }
   }
 
   private async drainSettled(
     pending: Map<number, Promise<{ key: number; settled: Settled }>>,
+    inflight: Map<number, PeerSource>,
     state: RunState,
   ): Promise<void> {
     const sentinel = Symbol('no-settled-result');
@@ -189,6 +271,7 @@ export class PeerReviewQuorumUseCase {
         return;
       }
       pending.delete(winner.key);
+      inflight.delete(winner.key);
       this.record(state, winner.settled);
     }
   }
@@ -274,62 +357,5 @@ export class PeerReviewQuorumUseCase {
     if (agreeing >= requiredWeight) {
       state.achieved = true;
     }
-  }
-
-  private assemble(
-    input: QuorumInput,
-    state: RunState,
-    tier: number,
-    requiredWeight: number,
-  ): Result<QuorumResult, DomainError> {
-    const sources: QuorumSourceReport[] = [...state.reports.values()].map((report) => ({
-      ...report,
-    }));
-    const base = {
-      achieved: state.achieved,
-      tier,
-      requiredWeight,
-      agreeingWeight: state.agreeingWeight,
-      sources,
-      usage: { ...state.usage },
-    };
-
-    // D7: any arbiter failure — including a later tier's re-evaluation failing
-    // after an earlier tier's eval succeeded — forces the fallback path below.
-    // A stale consensus must never surface with a non-zero certainty.
-    if (state.lastEval !== undefined && !state.arbiterFailed) {
-      const agreeingRatings = state.lastEval.ratings
-        .filter((r) => r.agreement >= AGREEMENT_THRESHOLD)
-        .map((r) => r.agreement);
-      return ok({
-        // Withhold prose no quorum validated. `response` stays a string ('') so
-        // clients reading it unconditionally are unaffected; the metadata below
-        // is returned in full so the verdict is still honestly transcribable.
-        response: state.achieved ? state.lastEval.consensus : '',
-        ...(state.achieved ? {} : { responseWithheld: true as const }),
-        certaintyScore: computeCertainty(state.agreeingWeight, requiredWeight, agreeingRatings),
-        // Last evaluation's caller rating wins across tier re-evaluations.
-        ...(input.callerAnswer !== undefined
-          ? { callerAgreement: state.lastEval.callerAgreement ?? null }
-          : {}),
-        ...base,
-      });
-    }
-
-    const top = [...state.successes].sort((a, b) => b.source.weight - a.source.weight)[0];
-    if (top === undefined) {
-      return err(new ExternalServiceError('No peer source produced a response', 'peer-review'));
-    }
-    return ok({
-      // Same withholding on the fallback path: an unachieved quorum must not hand
-      // back a single peer's raw text either — that is prose no quorum validated.
-      response: state.achieved ? top.response.text : '',
-      ...(state.achieved ? {} : { responseWithheld: true as const }),
-      certaintyScore: 0,
-      ...(state.arbiterFailed ? { arbiterFailed: true } : {}),
-      // No trusted evaluation on this path — a supplied caller answer is unrated.
-      ...(input.callerAnswer !== undefined ? { callerAgreement: null } : {}),
-      ...base,
-    });
   }
 }

@@ -6,7 +6,7 @@ import { ConfigurationError, type DomainError } from '../errors/index.js';
 export interface MutableReport {
   name: string;
   model: string;
-  status: 'ok' | 'error' | 'unavailable';
+  status: 'ok' | 'error' | 'unavailable' | 'skipped';
   weight: number;
   agreement: number | null;
   error?: string | undefined;
@@ -37,4 +37,15 @@ export function markOk(report: MutableReport): void {
 export function markFailed(report: MutableReport, error: DomainError): void {
   report.status = error instanceof ConfigurationError ? 'unavailable' : 'error';
   report.error = error.message;
+}
+
+/** Excluded as a redundant peer for this request — either the caller declared it
+ * IS this source (`callerSource`) or the caller is local and so is this source
+ * (`skipLocal`); both can hold at once. Never called, zero quorum weight, but
+ * itemized so the exclusion is transparent rather than a silent gap in
+ * `sources[]`. */
+export function markSkipped(report: MutableReport): void {
+  report.status = 'skipped';
+  report.agreement = null;
+  report.error = 'Skipped: excluded as a redundant peer for this request (callerSource/skipLocal)';
 }

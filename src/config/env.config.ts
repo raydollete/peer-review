@@ -10,6 +10,13 @@ const EnvSchema = z.object({
   PEER_REVIEW_DEADLINE_MS: z.coerce.number().int().positive().default(480000),
   PEER_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8192),
   PEER_CREDENTIAL_TTL_S: z.coerce.number().int().positive().default(3000),
+  // When true, sources flagged `local` in config are excluded from the quorum —
+  // set per-harness in that harness's MCP registration env block when the caller
+  // itself runs on the local backend. Accepts "true"/"1"/"false"/"0"/unset.
+  PEER_REVIEW_SKIP_LOCAL: z
+    .enum(['true', '1', 'false', '0'])
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 });
 
@@ -19,6 +26,7 @@ export interface EnvConfig {
   readonly deadlineMs: number;
   readonly maxOutputTokens: number;
   readonly credentialTtlS: number;
+  readonly skipLocal: boolean;
   readonly logLevel: string;
 }
 
@@ -36,6 +44,7 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     deadlineMs: parsed.data.PEER_REVIEW_DEADLINE_MS,
     maxOutputTokens: parsed.data.PEER_MAX_OUTPUT_TOKENS,
     credentialTtlS: parsed.data.PEER_CREDENTIAL_TTL_S,
+    skipLocal: parsed.data.PEER_REVIEW_SKIP_LOCAL,
     logLevel: parsed.data.LOG_LEVEL,
   };
 }

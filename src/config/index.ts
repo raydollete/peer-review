@@ -6,3 +6,4 @@ export {
   type SourceConfig,
 } from './peer-config.js';
 export { loadEnvConfig, type EnvConfig } from './env.config.js';
+export { validateTimeoutsAgainstDeadline } from './validate-timeouts.js';

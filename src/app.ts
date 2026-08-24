@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-import { loadEnvConfig, loadPeerConfig, sourceAvailable } from './config/index.js';
+import {
+  loadEnvConfig,
+  loadPeerConfig,
+  sourceAvailable,
+  validateTimeoutsAgainstDeadline,
+} from './config/index.js';
 import type { PeerSource } from './domain/ports/index.js';
 import {
   PeerReviewQuorumUseCase,
@@ -25,10 +30,22 @@ import {
 import { createLogger, type ILogger } from './shared/logger/index.js';
 import { ConfigurationError } from './shared/errors/index.js';
 
-function buildSources(logger: ILogger): { sources: PeerSource[]; arbiterName: string; deadlineMs: number; thresholds: Readonly<Record<number, number>> } {
+function buildSources(logger: ILogger): {
+  sources: PeerSource[];
+  arbiterName: string;
+  deadlineMs: number;
+  arbiterTimeoutMs: number;
+  skipLocal: boolean;
+  thresholds: Readonly<Record<number, number>>;
+} {
   const env = loadEnvConfig();
   const config = loadPeerConfig(env.configPath);
+  // Fail fast if no single tier wave + arbiter can fit the deadline — otherwise a
+  // slow source silently disables escalation at run time (see validate-timeouts).
+  validateTimeoutsAgainstDeadline(config, env);
   const limits = { timeoutMs: env.timeoutMs, maxOutputTokens: env.maxOutputTokens };
+  const arbiterConfig = config.sources.find((s) => s.name === config.arbiter);
+  const arbiterTimeoutMs = arbiterConfig?.timeoutMs ?? env.timeoutMs;
 
   const sources: PeerSource[] = config.sources.map((source) => {
     const credentialProvider = new CredentialProvider(source, {
@@ -47,14 +64,21 @@ function buildSources(logger: ILogger): { sources: PeerSource[]; arbiterName: st
       weight: source.weight,
       tier: source.tier,
       available,
+      local: source.local ?? false,
       client: createAdapter(source, limits, credentialProvider, {}, logger),
     };
   });
+
+  if (env.skipLocal && !sources.some((s) => s.local === true)) {
+    logger.warn('PEER_REVIEW_SKIP_LOCAL is set but no source is flagged local; nothing skipped');
+  }
 
   return {
     sources,
     arbiterName: config.arbiter,
     deadlineMs: env.deadlineMs,
+    arbiterTimeoutMs,
+    skipLocal: env.skipLocal,
     thresholds: config.thresholds,
   };
 }
@@ -63,14 +87,23 @@ async function main(): Promise<void> {
   const logLevel = process.env['LOG_LEVEL'] ?? 'info';
   const logger = createLogger(logLevel);
 
-  const { sources, arbiterName, deadlineMs, thresholds } = buildSources(logger);
+  const { sources, arbiterName, deadlineMs, arbiterTimeoutMs, skipLocal, thresholds } =
+    buildSources(logger);
   const arbiter = sources.find((source) => source.name === arbiterName);
   if (arbiter === undefined) {
     throw new ConfigurationError(`Arbiter "${arbiterName}" not found among built sources`);
   }
 
   const peerReviewController = new PeerReviewController(
-    new PeerReviewQuorumUseCase({ sources, arbiter, thresholds, deadlineMs, logger }),
+    new PeerReviewQuorumUseCase({
+      sources,
+      arbiter,
+      thresholds,
+      deadlineMs,
+      arbiterTimeoutMs,
+      skipLocal,
+      logger,
+    }),
   );
   const queryPeerController = new QueryPeerController(new QueryPeerUseCase(sources));
   const listPeersController = new ListPeersController(new ListPeersUseCase(sources));

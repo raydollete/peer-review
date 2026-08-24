@@ -11,6 +11,9 @@ export interface PeerSource {
   readonly weight: number;
   readonly tier: number;
   readonly available: boolean;
+  /** Served by the local inference backend; excluded when the caller is local
+   * (PEER_REVIEW_SKIP_LOCAL) to avoid self-contention. */
+  readonly local?: boolean | undefined;
   readonly client: IPeerClient;
 }
 

@@ -81,8 +81,9 @@ The server reads a JSON config file from `PEER_REVIEW_CONFIG` (default `./peer-r
 | `sources[].apiKeyCommand` | string | exactly one of these two | Command executed (via `sh -c`) to mint a short-lived bearer token, e.g. `gcloud auth print-access-token` for Vertex AI. Output is trimmed and cached (see `PEER_CREDENTIAL_TTL_S`); a 401 triggers one re-mint + retry. |
 | `sources[].weight` | positive int | yes | Weight this source contributes to quorum when it agrees with the consensus. |
 | `sources[].tier` | positive int | yes | Cost tier. Tier 1 is consulted first; higher tiers only on shortfall. |
+| `sources[].local` | bool | no | Marks a source served by the local inference backend. A caller that itself runs on that backend sets [`PEER_REVIEW_SKIP_LOCAL`](#environment-variables) so these sources are dropped from its requests (self-contention, not a second opinion). Locality, not model id. |
 
-Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), or a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`. Credential material never appears in config, logs, or responses.
+Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`, or a timeout budget that cannot fit one tier wave plus one arbiter evaluation inside `PEER_REVIEW_DEADLINE_MS` (a single slow source would otherwise consume the whole deadline and silently disable escalation). Credential material never appears in config, logs, or responses.
 
 ### Environment variables
 
@@ -90,7 +91,8 @@ Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` n
 |---|---|---|
 | `PEER_REVIEW_CONFIG` | `./peer-review.config.json` | Path to the config file. |
 | `PEER_TIMEOUT_MS` | `120000` | Per-source request timeout (includes retries). |
-| `PEER_REVIEW_DEADLINE_MS` | `240000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. |
+| `PEER_REVIEW_DEADLINE_MS` | `480000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Each tier also gets a slice of the remaining deadline as its own escalation timebox, so a slow, contended lower tier is abandoned in time to still reach a healthy higher one. |
+| `PEER_REVIEW_SKIP_LOCAL` | `false` | When true (`true`/`1`), every source flagged [`local`](#configuration) is excluded from the quorum for this server registration. Set it per-caller in that caller's MCP registration `env` when the caller itself runs on the local backend, so it does not contend with itself. The class-wide sibling of the per-request [`callerSource`](#peer_review) skip. |
 | `PEER_MAX_OUTPUT_TOKENS` | `8192` | Max output tokens injected server-side into every peer call. |
 | `PEER_CREDENTIAL_TTL_S` | `3000` | Cache TTL (seconds) for tokens minted via `apiKeyCommand`. |
 | `LOG_LEVEL` | `info` | pino log level (`fatal`\|`error`\|`warn`\|`info`\|`debug`\|`trace`). Logs go to stderr only. |
@@ -289,7 +291,7 @@ All tools return the envelope `{"success": true, "data": ...}` or `{"success": f
 
 ### `peer_review`
 
-Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack), optional `callerAnswer` (1–100000 chars — your own answer to the prompt). An unmet quorum is **not** an error — check `quorum.achieved` and `certaintyScore`.
+Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack), optional `callerAnswer` (1–100000 chars — your own answer to the prompt), optional `callerSource` (the name of a configured source the caller itself *is* — skipped as a redundant peer for this request, never called, itemized as `status: "skipped"`; an unknown name is a logged no-op). An unmet quorum is **not** an error — check `quorum.achieved` and `certaintyScore`.
 
 ```jsonc
 // request
@@ -312,7 +314,7 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
 }
 ```
 
-`sources[].status` is `ok`, `error`, or `unavailable`; `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
+`sources[].status` is `ok`, `error`, `unavailable`, or `skipped` (excluded from this request via `callerSource`/`PEER_REVIEW_SKIP_LOCAL` — never called, zero quorum weight); `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
 
 **Including your own answer (`callerAnswer`).** When you already have an answer and want to know whether independent peers endorse it, pass it as `callerAnswer` instead of pasting it into `prompt`. Peers never see it — they answer the prompt blind, so their independence is preserved and `certaintyScore` stays an anchoring-free signal. The arbiter is instructed to derive the consensus **only** from the peer answers and then rate your answer against that consensus, so a confidently-wrong `callerAnswer` cannot pull the consensus toward itself. The response gains a `callerAgreement` field (0–1).
 

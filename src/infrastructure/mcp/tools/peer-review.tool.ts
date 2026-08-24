@@ -46,6 +46,12 @@ Sources are consulted in cost tiers: cheap tier-1 peers first, escalating to hig
         minLength: 1,
         maxLength: 100000,
       },
+      callerSource: {
+        type: 'string',
+        description:
+          'the configured source you already are — skipped as a redundant peer for this request. When your own answer was produced by a model this server also consults as a peer (e.g. you run the same local LLM), name that source here so it is not double-counted; it is never called and appears in sources[] as status "skipped". An unknown name is a logged no-op.',
+        minLength: 1,
+      },
     },
     required: ['prompt'],
   },
