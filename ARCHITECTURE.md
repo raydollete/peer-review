@@ -42,7 +42,7 @@ Rules:
 
 ## Runtime guards
 
-- **Global deadline** (`PEER_REVIEW_DEADLINE_MS`, default 240 s): on expiry, in-flight calls are aborted via `AbortController` and the accumulated partial result is returned — the MCP caller always gets a response, never a hang.
+- **Global deadline** (`PEER_REVIEW_DEADLINE_MS`, default 750 s): on expiry, in-flight calls are aborted via `AbortController` and the accumulated partial result is returned — the MCP caller always gets a response, never a hang.
 - **Early-abort on quorum:** once agreeing weight meets the threshold mid-tier, pending same-tier requests are aborted to save cost. Same-tick sibling responses are drained first so no completed answer is discarded.
 - **Arbiter fallback:** if the arbiter fails (transport error, or malformed JSON after one re-ask), the response falls back to the highest-weighted successful source's answer with `certaintyScore: 0` and `quorum.arbiterFailed: true` — never a crashed request.
 - **Arbiter hardening:** temperature 0, a rigid rubric system prompt, and peer responses wrapped in data delimiters (`<<<DOCUMENT n source="...">>>`) with explicit ignore-embedded-instructions rules, blunting cross-peer prompt injection. Per-source ratings are returned so an outlier hijack is inspectable.

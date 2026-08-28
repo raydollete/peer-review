@@ -28,10 +28,11 @@ export interface QuorumDeps {
   readonly arbiter: PeerSource;
   readonly thresholds: Readonly<Record<number, number>>;
   readonly deadlineMs: number;
-  /** The arbiter's effective request timeout, reserved out of each tier's budget
-   * so an evaluation always fits before the outer wall. Defaults to 0 (no
-   * reserve) when unset — production wires the arbiter source's real timeout. */
+  /** Applied to each evaluation independently; test-only callers default it to
+   * the current tier budget. */
   readonly arbiterTimeoutMs?: number | undefined;
+  /** Production peer-wave allowances; tests may retain the generic fair share. */
+  readonly tierTimeoutMs?: Readonly<Record<number, number>> | undefined;
   /** When true, every source flagged `local` is excluded from the quorum for the
    * request — the class-wide sibling of a per-request `callerSource` skip. Set
    * per-harness via PEER_REVIEW_SKIP_LOCAL when the caller runs on the local
@@ -39,7 +40,6 @@ export interface QuorumDeps {
   readonly skipLocal?: boolean | undefined;
   readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
-
 export interface RunState {
   readonly reports: Map<string, MutableReport>;
   readonly successes: Array<{ source: PeerSource; response: PeerResponse }>;
@@ -51,7 +51,6 @@ export interface RunState {
   evaluatedCount: number;
   deadlineHit: boolean;
 }
-
 interface Settled {
   readonly source: PeerSource;
   readonly result: Result<PeerResponse, DomainError>;
@@ -142,14 +141,13 @@ export class PeerReviewQuorumUseCase {
       }
       reachedTier = tier;
       const tiersRemaining = tiers.length - tiers.indexOf(tier);
-      const tierBudget = computeTierBudget(
-        this.deps.deadlineMs,
-        Date.now() - start,
-        tiersRemaining,
-        this.deps.arbiterTimeoutMs ?? 0,
+      const fallbackTierBudget = computeTierBudget(
+        this.deps.deadlineMs, Date.now() - start, tiersRemaining, 0,
       );
-      const tierSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(tierBudget)]);
-      await this.runTier(tier, input, state, controller, requiredWeight, tierSignal);
+      const peerTimeoutMs = this.deps.tierTimeoutMs?.[tier] ?? fallbackTierBudget;
+      const arbiterTimeoutMs = this.deps.arbiterTimeoutMs ?? fallbackTierBudget;
+      const peerSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(peerTimeoutMs)]);
+      await this.runTier(tier, input, state, controller, requiredWeight, peerSignal, arbiterTimeoutMs);
       if (state.achieved || state.deadlineHit) {
         break;
       }
@@ -207,15 +205,16 @@ export class PeerReviewQuorumUseCase {
     state: RunState,
     controller: AbortController,
     requiredWeight: number,
-    tierSignal: AbortSignal,
+    peerSignal: AbortSignal,
+    arbiterTimeoutMs: number,
   ): Promise<void> {
-    const { pending, inflight } = this.launchTier(tier, input, state, tierSignal);
+    const { pending, inflight } = this.launchTier(tier, input, state, peerSignal);
 
     // Resolves when the tier signal aborts — either the global wall (terminal)
     // or this tier's own budget elapsing (non-terminal → escalate). One listener
     // for the whole tier; the runtime owns its cleanup.
     const tierAborted = Symbol('tier-signal-aborted');
-    const abortRace = signalAbortPromise(tierSignal, tierAborted);
+    const abortRace = signalAbortPromise(peerSignal, tierAborted);
 
     while (pending.size > 0) {
       const winner = await Promise.race<{ key: number; settled: Settled } | typeof tierAborted>([
@@ -242,7 +241,7 @@ export class PeerReviewQuorumUseCase {
         return;
       }
       if (!state.achieved && pending.size > 0 && this.quorumPossible(state, requiredWeight)) {
-        await this.evaluate(input, state, tierSignal, requiredWeight);
+        await this.evaluate(input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         if (state.achieved) {
           // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
           controller.abort();
@@ -252,7 +251,7 @@ export class PeerReviewQuorumUseCase {
     }
 
     if (!state.achieved && !state.deadlineHit && state.successes.length > state.evaluatedCount) {
-      await this.evaluate(input, state, tierSignal, requiredWeight);
+      await this.evaluate(input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
     }
   }
 
@@ -319,9 +318,14 @@ export class PeerReviewQuorumUseCase {
   private async evaluate(
     input: QuorumInput,
     state: RunState,
-    signal: AbortSignal,
+    controllerSignal: AbortSignal,
+    arbiterTimeoutMs: number,
     requiredWeight: number,
   ): Promise<void> {
+    const signal = AbortSignal.any([
+      controllerSignal,
+      AbortSignal.timeout(arbiterTimeoutMs),
+    ]);
     const evaluation = await evaluateAgreement({
       arbiter: { name: this.deps.arbiter.name, client: this.deps.arbiter.client },
       question: input.prompt,

@@ -543,6 +543,31 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(result.responseWithheld).toBeUndefined();
   });
 
+  it('preserves the configured final-tier peer allowance before arbitration', async () => {
+    const slow = makeSource('slow', 1, 1, resolvesOnAbortOnly);
+    const kimi = makeSource('kimi', 2, 2, resolvesAfterDelay(58, 'Kimi answer'));
+    const arbiter = makeArbiter([{ kimi: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [slow, kimi],
+      arbiter,
+      thresholds: { 1: 2, 2: 2 },
+      // The validated schedule is t1 peer (30) + arbiter (20) + t2 peer (60)
+      // + arbiter (20). A shared 130ms deadline slice would cap tier 2 at
+      // about 55ms after tier 1, incorrectly aborting the 58ms final peer.
+      deadlineMs: 130,
+      tierTimeoutMs: { 1: 30, 2: 60 },
+      arbiterTimeoutMs: 20,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(slow.calls).toHaveLength(1);
+    expect(kimi.calls).toHaveLength(1);
+    expect(result.sources.find((s) => s.name === 'kimi')?.status).toBe('ok');
+    expect(result.achieved).toBe(true);
+    expect(result.tier).toBe(2);
+  });
+
   it('preserves a tier-1 success and re-evaluates it after a straggler forces escalation', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'Paris'));
     const slow = makeSource('slow', 1, 1, resolvesAfterDelay(10000));

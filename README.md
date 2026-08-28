@@ -83,7 +83,7 @@ The server reads a JSON config file from `PEER_REVIEW_CONFIG` (default `./peer-r
 | `sources[].tier` | positive int | yes | Cost tier. Tier 1 is consulted first; higher tiers only on shortfall. |
 | `sources[].local` | bool | no | Marks a source served by the local inference backend. A caller that itself runs on that backend sets [`PEER_REVIEW_SKIP_LOCAL`](#environment-variables) so these sources are dropped from its requests (self-contention, not a second opinion). Locality, not model id. |
 
-Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`, or a timeout budget that cannot fit one tier wave plus one arbiter evaluation inside `PEER_REVIEW_DEADLINE_MS` (a single slow source would otherwise consume the whole deadline and silently disable escalation). Credential material never appears in config, logs, or responses.
+Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`, or a timeout budget that cannot fit every sequential tier wave plus its arbiter evaluation inside `PEER_REVIEW_DEADLINE_MS`. Each wave is sized to its slowest configured peer, then gets a separate arbiter allowance, so the final escalation tier is not silently cut short. Credential material never appears in config, logs, or responses.
 
 ### Environment variables
 
@@ -91,7 +91,7 @@ Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` n
 |---|---|---|
 | `PEER_REVIEW_CONFIG` | `./peer-review.config.json` | Path to the config file. |
 | `PEER_TIMEOUT_MS` | `120000` | Per-source request timeout (includes retries). |
-| `PEER_REVIEW_DEADLINE_MS` | `480000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Each tier also gets a slice of the remaining deadline as its own escalation timebox, so a slow, contended lower tier is abandoned in time to still reach a healthy higher one. |
+| `PEER_REVIEW_DEADLINE_MS` | `750000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Each tier’s peer wave gets its configured timeout, followed by a separate arbiter timeout; startup rejects a deadline too small for the full configured sequential path. |
 | `PEER_REVIEW_SKIP_LOCAL` | `false` | When true (`true`/`1`), every source flagged [`local`](#configuration) is excluded from the quorum for this server registration. Set it per-caller in that caller's MCP registration `env` when the caller itself runs on the local backend, so it does not contend with itself. The class-wide sibling of the per-request [`callerSource`](#peer_review) skip. |
 | `PEER_MAX_OUTPUT_TOKENS` | `8192` | Max output tokens injected server-side into every peer call. |
 | `PEER_CREDENTIAL_TTL_S` | `3000` | Cache TTL (seconds) for tokens minted via `apiKeyCommand`. |

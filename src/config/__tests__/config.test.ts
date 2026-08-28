@@ -149,7 +149,7 @@ describe('env config', () => {
     const { loadEnvConfig } = await import('../env.config.js');
     const env = loadEnvConfig({});
     expect(env.timeoutMs).toBe(120000);
-    expect(env.deadlineMs).toBe(480000);
+    expect(env.deadlineMs).toBe(750000);
     expect(env.maxOutputTokens).toBe(8192);
     expect(env.credentialTtlS).toBe(3000);
     expect(env.logLevel).toBe('info');
@@ -180,36 +180,54 @@ describe('timeout-vs-deadline startup guard', () => {
     validateTimeoutsAgainstDeadline(parsePeerConfig(rawConfig), loadEnvConfig(env));
   }
 
-  it('throws when the largest source timeout plus arbiter cannot fit the deadline', async () => {
+  it('throws when sequential tier waves plus arbitration cannot fit the deadline', async () => {
     const config = clone();
-    // beta is NOT the arbiter (alpha is), so this exercises source + arbiter as
-    // distinct terms: 400000 (beta) + 120000 (alpha, default) = 520000.
+    // tier 1: 120000 + 120000; tier 2: 400000 + 120000 = 760000.
     config.sources[1]!['timeoutMs'] = 400000;
     await expect(
       validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
     ).rejects.toThrow(ConfigurationError);
   });
 
-  it('names the offending timeout, the arbiter timeout, and the deadline', async () => {
+  it('names the tier allocations, arbiter timeout, and deadline', async () => {
     const config = clone();
     config.sources[1]!['timeoutMs'] = 400000;
     await expect(
       validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
-    ).rejects.toThrow(/400000.*120000.*480000/s);
+    ).rejects.toThrow(/tier 1.*120000.*tier 2.*400000.*120000.*480000/s);
   });
 
-  it('passes when one wave plus arbiter fits within the deadline', async () => {
+  it('passes when every sequential wave plus arbiter fits within the deadline', async () => {
     const config = clone();
-    config.sources[1]!['timeoutMs'] = 200000; // 200000 + arbiter 120000 = 320000 < 480000
+    config.sources[1]!['timeoutMs'] = 200000; // (120000 + 120000) + (200000 + 120000) < 750000
+    await expect(
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '750000' }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('rejects the Kimi-shaped 480000ms deadline as too short for full escalation', async () => {
+    const config = clone();
+    config.sources[0]!['timeoutMs'] = 120000; // arbiter
+    config.sources[1]!['timeoutMs'] = 300000;
+    config.sources.push({
+      name: 'deepseek',
+      apiType: 'openai',
+      baseUrl: 'https://api.example.com/v1',
+      model: 'model-c',
+      apiKeyEnv: 'DEEPSEEK_KEY',
+      weight: 1,
+      tier: 1,
+      timeoutMs: 180000,
+    });
     await expect(
       validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow(/720000.*480000/s);
   });
 
   it('accepts the shipped default config under default env', async () => {
     const { loadPeerConfig, loadEnvConfig } = await import('../index.js');
     const { validateTimeoutsAgainstDeadline } = await import('../validate-timeouts.js');
-    // max source 300000 (kimi-k3) + arbiter 120000 (gemini-flash default) = 420000 < 480000
+    // tier 1: 180000 + 120000; tier 2: 300000 + 120000 = 720000 < 750000.
     expect(() =>
       validateTimeoutsAgainstDeadline(
         loadPeerConfig('./peer-review.config.json'),

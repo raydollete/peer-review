@@ -30,22 +30,33 @@ import {
 import { createLogger, type ILogger } from './shared/logger/index.js';
 import { ConfigurationError } from './shared/errors/index.js';
 
+function collectTierTimeouts(
+  sources: ReturnType<typeof loadPeerConfig>['sources'],
+  defaultTimeoutMs: number,
+): Record<number, number> {
+  return sources.reduce<Record<number, number>>((timeouts, source) => {
+    timeouts[source.tier] = Math.max(timeouts[source.tier] ?? 0, source.timeoutMs ?? defaultTimeoutMs);
+    return timeouts;
+  }, {});
+}
+
 function buildSources(logger: ILogger): {
   sources: PeerSource[];
   arbiterName: string;
   deadlineMs: number;
   arbiterTimeoutMs: number;
+  tierTimeoutMs: Readonly<Record<number, number>>;
   skipLocal: boolean;
   thresholds: Readonly<Record<number, number>>;
 } {
   const env = loadEnvConfig();
   const config = loadPeerConfig(env.configPath);
-  // Fail fast if no single tier wave + arbiter can fit the deadline — otherwise a
-  // slow source silently disables escalation at run time (see validate-timeouts).
+  // Fail fast if the full sequential escalation path cannot fit the deadline.
   validateTimeoutsAgainstDeadline(config, env);
   const limits = { timeoutMs: env.timeoutMs, maxOutputTokens: env.maxOutputTokens };
   const arbiterConfig = config.sources.find((s) => s.name === config.arbiter);
   const arbiterTimeoutMs = arbiterConfig?.timeoutMs ?? env.timeoutMs;
+  const tierTimeoutMs = collectTierTimeouts(config.sources, env.timeoutMs);
 
   const sources: PeerSource[] = config.sources.map((source) => {
     const credentialProvider = new CredentialProvider(source, {
@@ -78,6 +89,7 @@ function buildSources(logger: ILogger): {
     arbiterName: config.arbiter,
     deadlineMs: env.deadlineMs,
     arbiterTimeoutMs,
+    tierTimeoutMs,
     skipLocal: env.skipLocal,
     thresholds: config.thresholds,
   };
@@ -87,7 +99,7 @@ async function main(): Promise<void> {
   const logLevel = process.env['LOG_LEVEL'] ?? 'info';
   const logger = createLogger(logLevel);
 
-  const { sources, arbiterName, deadlineMs, arbiterTimeoutMs, skipLocal, thresholds } =
+  const { sources, arbiterName, deadlineMs, arbiterTimeoutMs, tierTimeoutMs, skipLocal, thresholds } =
     buildSources(logger);
   const arbiter = sources.find((source) => source.name === arbiterName);
   if (arbiter === undefined) {
@@ -101,6 +113,7 @@ async function main(): Promise<void> {
       thresholds,
       deadlineMs,
       arbiterTimeoutMs,
+      tierTimeoutMs,
       skipLocal,
       logger,
     }),

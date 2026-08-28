@@ -29,7 +29,7 @@ const DEEP_PROMPT =
   'failure scenario: a service fans out one prompt to several LLMs in parallel, ' +
   'sends every answer to one arbiter model for per-source agreement ratings, sums ' +
   'those ratings by integer weight, and escalates to a second, larger fan-out when ' +
-  'the sum misses a threshold — all inside one shared 480s deadline. Be specific ' +
+  'the sum misses a threshold — all inside one shared 750s deadline. Be specific ' +
   'about deadline budgeting, arbiter self-rating, threshold calibration, and ' +
   'partial-outage semantics.';
 
