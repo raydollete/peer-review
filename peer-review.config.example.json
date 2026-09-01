@@ -1,35 +1,47 @@
 {
-  "thresholds": { "tier1": 2, "tier2": 4 },
-  "arbiter": "gpt-large",
+  "thresholds": { "tier1": 2, "tier2": 3 },
+  "arbiter": "gemini-flash",
   "sources": [
     {
-      "name": "gpt-large",
+      "name": "deepseek-flash",
       "apiType": "openai",
-      "baseUrl": "https://api.openai.com/v1",
-      "model": "gpt-5.2",
-      "apiKeyEnv": "OPENAI_API_KEY",
-      "weight": 2,
-      "tier": 1
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "weight": 1,
+      "tier": 1,
+      "timeoutMs": 180000
     },
     {
-      "name": "gemini",
+      "name": "gemini-flash",
       "apiType": "openai",
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
-      "model": "gemini-3-pro",
+      "model": "gemini-3-flash",
       "apiKeyEnv": "GEMINI_API_KEY",
-      "weight": 2,
-      "tier": 1
+      "weight": 1,
+      "tier": 1,
+      "timeoutMs": 120000
     },
     {
-      "name": "claude",
-      "apiType": "anthropic",
-      "baseUrl": "https://api.anthropic.com",
-      "model": "claude-fable-5",
-      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "name": "glm-flash",
+      "apiType": "openai",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "z-ai/glm-5.3-flash",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "weight": 1,
+      "tier": 1,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "kimi-k3",
+      "apiType": "openai",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "moonshotai/kimi-k3",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
       "weight": 2,
       "tier": 2,
-      "timeoutMs": 180000,
-      "maxOutputTokens": 16384
+      "timeoutMs": 300000,
+      "maxOutputTokens": 24576
     }
   ]
 }

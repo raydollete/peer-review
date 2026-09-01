@@ -155,6 +155,49 @@ async function performFetch(
   }
 }
 
+/**
+ * Read and parse a successful response body as two SEPARATE steps so a failure in
+ * each is attributed to its true cause. The Response resolves as soon as headers
+ * arrive; the body then streams — for a slow reasoning model, for minutes, behind
+ * gateway keep-alive padding. A failure DURING that read is honestly attributed
+ * exactly as performFetch does for the initial fetch: orchestrator cancellation
+ * takes priority; then our own per-request deadline (checked signal-independently)
+ * or an abort-shaped error is a timeout; anything else — a premature socket close
+ * / proxy reset (undici `TypeError: terminated`) — is a transport error, NEVER a
+ * malformed body. Only a genuine parse failure over a fully-received body is
+ * "not valid JSON", so a healthy-but-slow source is never scapegoated.
+ */
+async function readJsonBody(
+  response: Response,
+  cfg: PostJsonConfig,
+  deadline: number,
+): Promise<Result<unknown, DomainError>> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    if (cfg.signal?.aborted === true) {
+      return err(cancelledError(cfg.serviceName));
+    }
+    if (Date.now() >= deadline || isAbortError(error)) {
+      return err(
+        new TimeoutError(
+          `Request to "${cfg.serviceName}" timed out while reading the response body`,
+          cfg.timeoutMs,
+        ),
+      );
+    }
+    return err(
+      new ExternalServiceError(`Network error reading response body: ${String(error)}`, cfg.serviceName),
+    );
+  }
+  try {
+    return ok(JSON.parse(text) as unknown);
+  } catch {
+    return err(new ExternalServiceError('Response body is not valid JSON', cfg.serviceName));
+  }
+}
+
 export async function postJson(
   cfg: PostJsonConfig,
   deps: HttpDeps = {},
@@ -183,11 +226,7 @@ export async function postJson(
     const response = attempt.value;
 
     if (response.ok) {
-      try {
-        return ok((await response.json()) as unknown);
-      } catch {
-        return err(new ExternalServiceError('Response body is not valid JSON', cfg.serviceName));
-      }
+      return readJsonBody(response, cfg, deadline);
     }
 
     if (response.status === 401 && !state.authRetried) {

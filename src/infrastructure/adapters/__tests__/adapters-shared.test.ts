@@ -178,6 +178,72 @@ describe('shared adapter HTTP behavior', () => {
     const result = await call(fetchMock);
     expect(result._unsafeUnwrapErr()).toBeInstanceOf(ExternalServiceError);
   });
+
+  // The Response resolves on headers; the body then streams (for a slow reasoning
+  // model, minutes, behind keep-alive whitespace). A failure DURING that body read
+  // must be attributed to its true cause — abort, transport drop, or malformed —
+  // not blanket-mislabeled as an invalid body.
+  it('maps a per-source timeout DURING the body read to TimeoutError, not "not valid JSON"', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.reject(Object.assign(new Error('aborted'), { name: 'TimeoutError' })),
+    } as unknown as Response);
+    const result = await call(fetchMock);
+    expect(result._unsafeUnwrapErr()).toBeInstanceOf(TimeoutError);
+  });
+
+  it('maps an orchestrator cancellation DURING the body read to a cancellation error, not "not valid JSON"', async () => {
+    const controller = new AbortController();
+    const fetchMock = jest.fn<typeof fetch>().mockImplementation(async () => {
+      controller.abort(); // orchestrator cancels while the body is being read
+      return {
+        ok: true,
+        status: 200,
+        text: () => Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+      } as unknown as Response;
+    });
+    const error = (await call(fetchMock, undefined, 5000, controller.signal))._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error).not.toBeInstanceOf(TimeoutError);
+    expect(error.message).toContain('cancelled');
+  });
+
+  it('maps a transport drop DURING the body read (e.g. undici "terminated") to a network error, not "not valid JSON"', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.reject(new TypeError('terminated')), // premature socket close mid-stream
+    } as unknown as Response);
+    const error = (await call(fetchMock))._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error).not.toBeInstanceOf(TimeoutError);
+    expect(error.message).toContain('Network error');
+    expect(error.message).not.toContain('not valid JSON');
+  });
+
+  it('tolerates leading keep-alive whitespace padding before the JSON body', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      new Response(`\n         \n\n         ${JSON.stringify({ ok: true })}`, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const result = await call(fetchMock);
+    expect(result._unsafeUnwrap()).toEqual({ ok: true });
+  });
+
+  it('still maps a genuinely malformed body to ExternalServiceError', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      new Response('this is not json {{{', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const error = (await call(fetchMock))._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error.message).toContain('not valid JSON');
+  });
 });
 
 describe('adapter factory', () => {
