@@ -26,6 +26,7 @@ export function createAdapter(
     maxOutputTokens: source.maxOutputTokens ?? limits.maxOutputTokens,
     credentialProvider,
     ...(logger !== undefined ? { logger } : {}),
+    ...(source.jsonMode !== undefined ? { jsonMode: source.jsonMode } : {}),
   };
   switch (source.apiType) {
     case 'openai':

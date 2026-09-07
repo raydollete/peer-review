@@ -26,6 +26,10 @@ const SourceSchema = z.object({
   // itself running on that backend (PEER_REVIEW_SKIP_LOCAL), consulting it is
   // self-contention, so it is skipped for the request. Locality, not model id.
   local: z.boolean().optional(),
+  // Opt-in structured-output request for the arbiter. OpenAI-compatible
+  // sources only — the anthropic wire format has no equivalent, so
+  // cross-validation rejects it there.
+  jsonMode: z.boolean().optional(),
 });
 
 const TIER_KEY_PATTERN = /^(?:tier)?([0-9]+)$/;
@@ -82,6 +86,12 @@ function crossValidate(config: PeerReviewConfig): void {
     if (config.thresholds[source.tier] === undefined) {
       throw new ConfigurationError(
         `Source "${source.name}" uses tier ${source.tier} but no threshold is configured for it`,
+      );
+    }
+
+    if (source.jsonMode === true && source.apiType === 'anthropic') {
+      throw new ConfigurationError(
+        `Source "${source.name}" declares jsonMode but apiType "anthropic" has no structured-output mode`,
       );
     }
   }

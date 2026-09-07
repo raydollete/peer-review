@@ -43,6 +43,9 @@ export interface OpenAiCompatAdapterConfig {
   readonly maxOutputTokens: number;
   readonly credentialProvider: ICredentialProvider;
   readonly logger?: Pick<ILogger, 'warn'>;
+  /** Opt-in structured-output request; only honoured when the request
+   * carries the `responseFormat: 'json'` hint. */
+  readonly jsonMode?: boolean;
 }
 
 type WireMessage = { role: 'system' | 'user' | 'assistant'; content: string };
@@ -61,6 +64,9 @@ export class OpenAiCompatAdapter implements IPeerClient {
     };
     if (request.temperature !== undefined) {
       body['temperature'] = request.temperature;
+    }
+    if (this.cfg.jsonMode === true && request.responseFormat === 'json') {
+      body['response_format'] = { type: 'json_object' };
     }
 
     const result = await postJson(

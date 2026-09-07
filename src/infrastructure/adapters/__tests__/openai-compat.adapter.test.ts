@@ -1,5 +1,5 @@
 import { jest } from '@jest/globals';
-import { OpenAiCompatAdapter } from '../openai-compat.adapter.js';
+import { OpenAiCompatAdapter, type OpenAiCompatAdapterConfig } from '../openai-compat.adapter.js';
 import { ExternalServiceError } from '../../../shared/errors/index.js';
 import { PeerApiError, PeerRateLimitError } from '../../../domain/errors/index.js';
 import { StubCredentialProvider, jsonResponse, instantDeps } from './test-helpers.js';
@@ -20,6 +20,7 @@ const successFixture = {
 function makeAdapter(
   fetchFn: typeof fetch,
   logger?: { warn: (message: string, context?: Record<string, unknown>) => void },
+  overrides: Partial<Pick<OpenAiCompatAdapterConfig, 'jsonMode'>> = {},
 ): OpenAiCompatAdapter {
   return new OpenAiCompatAdapter(
     {
@@ -30,6 +31,7 @@ function makeAdapter(
       maxOutputTokens: 1024,
       credentialProvider: new StubCredentialProvider('sk-test'),
       ...(logger !== undefined ? { logger } : {}),
+      ...overrides,
     },
     instantDeps(fetchFn),
   );
@@ -90,6 +92,30 @@ describe('OpenAiCompatAdapter', () => {
     await makeAdapter(fetchMock).complete({ prompt: 'q' });
     const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
     expect('temperature' in body).toBe(false);
+  });
+
+  it('sends response_format json_object when jsonMode is on and the request asks for json', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(successFixture));
+    await makeAdapter(fetchMock, undefined, { jsonMode: true }).complete({
+      prompt: 'q',
+      responseFormat: 'json',
+    });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('omits response_format when jsonMode is on but the request carries no hint (peer call)', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(successFixture));
+    await makeAdapter(fetchMock, undefined, { jsonMode: true }).complete({ prompt: 'q' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+    expect('response_format' in body).toBe(false);
+  });
+
+  it('omits response_format when the request asks for json but jsonMode is off', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(successFixture));
+    await makeAdapter(fetchMock).complete({ prompt: 'q', responseFormat: 'json' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]?.body));
+    expect('response_format' in body).toBe(false);
   });
 
   it('retries 429 twice with backoff then returns PeerRateLimitError', async () => {

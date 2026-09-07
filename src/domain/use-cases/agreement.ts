@@ -147,6 +147,7 @@ export async function evaluateAgreement(
       systemInstruction,
       temperature: 0,
       signal: params.signal,
+      responseFormat: 'json',
     });
     if (result.isErr()) {
       return err(result.error);

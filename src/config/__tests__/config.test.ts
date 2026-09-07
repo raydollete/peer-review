@@ -47,6 +47,32 @@ describe('peer config', () => {
     expect(config.sources[1]?.local).toBeUndefined();
   });
 
+  it('parses the optional per-source jsonMode flag, defaulting undefined', () => {
+    const raw = clone();
+    raw.sources[0]!['jsonMode'] = true;
+    const config = parsePeerConfig(raw);
+    expect(config.sources[0]?.jsonMode).toBe(true);
+    expect(config.sources[1]?.jsonMode).toBeUndefined();
+  });
+
+  it('rejects jsonMode on an anthropic source, naming the source', () => {
+    const raw = clone();
+    raw.sources[1]!['jsonMode'] = true;
+    expect(() => parsePeerConfig(raw)).toThrow(ConfigurationError);
+    expect(() => parsePeerConfig(raw)).toThrow(/Source "beta" declares jsonMode/);
+  });
+
+  it('accepts an anthropic source that does not declare jsonMode', () => {
+    expect(() => parsePeerConfig(validConfig)).not.toThrow();
+    expect(parsePeerConfig(validConfig).sources[1]?.apiType).toBe('anthropic');
+  });
+
+  it('accepts jsonMode on an openai source', () => {
+    const raw = clone();
+    raw.sources[0]!['jsonMode'] = true;
+    expect(() => parsePeerConfig(raw)).not.toThrow();
+  });
+
   it('parses optional per-source timeoutMs and maxOutputTokens', () => {
     const raw = clone();
     raw.sources[0]!['timeoutMs'] = 180000;

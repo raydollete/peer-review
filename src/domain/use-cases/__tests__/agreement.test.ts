@@ -36,6 +36,42 @@ describe('evaluateAgreement', () => {
     expect(request.prompt).toContain('<<<QUESTION>>>');
   });
 
+  it('requests a JSON reply on a first-try run', async () => {
+    const arbiter = makeArbiter([{ alpha: 0.9 }]);
+    await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+    });
+    expect(arbiter.calls).toHaveLength(1);
+    expect(arbiter.calls[0]?.responseFormat).toBe('json');
+  });
+
+  it('requests a JSON reply on both calls of a re-ask run', async () => {
+    const arbiter = makeArbiter(['garbage', { alpha: 1 }]);
+    await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+    });
+    expect(arbiter.calls).toHaveLength(2);
+    expect(arbiter.calls[0]?.responseFormat).toBe('json');
+    expect(arbiter.calls[1]?.responseFormat).toBe('json');
+  });
+
+  it('keeps the rating scale and JSON-only rules alongside the concise-consensus wording', async () => {
+    const arbiter = makeArbiter([{ alpha: 0.9 }]);
+    await evaluateAgreement({
+      arbiter,
+      question: 'q',
+      responses: [peerResponse('alpha', 'a')],
+    });
+    const systemInstruction = arbiter.calls[0]?.systemInstruction;
+    expect(systemInstruction).toContain('0 (contradicts) to 1 (fully agrees)');
+    expect(systemInstruction).toContain('ONLY a single JSON object');
+    expect(systemInstruction).toContain('State it concisely');
+  });
+
   it('re-asks once on malformed JSON then succeeds', async () => {
     const arbiter = makeArbiter(['garbage', { alpha: 1 }]);
     const result = await evaluateAgreement({

@@ -311,4 +311,36 @@ describe('adapter factory', () => {
       .complete({ prompt: 'q' });
     expect(JSON.parse(String(defaultFetch.mock.calls[0]![1]?.body)).max_tokens).toBe(100);
   });
+
+  it('threads jsonMode from the source config into the OpenAI adapter request body', async () => {
+    const source = {
+      name: 's',
+      apiType: 'openai' as const,
+      baseUrl: 'https://x.example',
+      model: 'm',
+      apiKeyEnv: 'K',
+      weight: 1,
+      tier: 1,
+    };
+    const success = (): Response =>
+      jsonResponse({ choices: [{ message: { content: '{}' }, finish_reason: 'stop' }] });
+
+    const jsonModeFetch = jest.fn<typeof fetch>().mockResolvedValue(success());
+    await createAdapter(
+      { ...source, jsonMode: true },
+      limits,
+      new StubCredentialProvider('k'),
+      instantDeps(jsonModeFetch),
+    ).complete({ prompt: 'q', responseFormat: 'json' });
+    expect(JSON.parse(String(jsonModeFetch.mock.calls[0]![1]?.body)).response_format).toEqual({
+      type: 'json_object',
+    });
+
+    const defaultFetch = jest.fn<typeof fetch>().mockResolvedValue(success());
+    await createAdapter(source, limits, new StubCredentialProvider('k'), instantDeps(defaultFetch))
+      .complete({ prompt: 'q', responseFormat: 'json' });
+    expect(JSON.parse(String(defaultFetch.mock.calls[0]![1]?.body))).not.toHaveProperty(
+      'response_format',
+    );
+  });
 });
