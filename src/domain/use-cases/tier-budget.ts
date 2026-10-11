@@ -1,6 +1,6 @@
 import type { PeerSource } from '../ports/index.js';
 import { ExternalServiceError } from '../errors/index.js';
-import { markFailed, type MutableReport } from './source-reports.js';
+import { markCancelled, markFailed, type MutableReport } from './source-reports.js';
 
 /** Floor for a tier's time budget: the escalation timebox must never go
  * non-positive (which would abandon a tier before it can launch), even when the
@@ -51,6 +51,22 @@ export function markPendingOutage(
         report,
         new ExternalServiceError('tier budget elapsed — still in flight', source.name),
       );
+    }
+  }
+}
+
+/**
+ * Quorum met with peers still in flight: the early-abort cancels them. Mark each
+ * still-launched source that never settled as cancelled — not needed, not failed.
+ */
+export function markPendingCancelled(
+  inflight: Map<number, PeerSource>,
+  reports: Map<string, MutableReport>,
+): void {
+  for (const source of inflight.values()) {
+    const report = reports.get(source.name);
+    if (report !== undefined && report.status === 'error') {
+      markCancelled(report);
     }
   }
 }

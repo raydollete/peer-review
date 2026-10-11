@@ -2,7 +2,7 @@ import { ok, err, type Result } from 'neverthrow';
 import type { PeerSource, IPeerClient } from '../../ports/index.js';
 import type { PeerRequest, PeerResponse } from '../../entities/index.js';
 import { PeerApiError } from '../../errors/index.js';
-import { TimeoutError, type DomainError } from '../../../shared/errors/index.js';
+import { ExternalServiceError, type DomainError } from '../../../shared/errors/index.js';
 
 export type CompleteFn = (request: PeerRequest) => Promise<Result<PeerResponse, DomainError>>;
 
@@ -71,10 +71,12 @@ export function resolvesAfterDelay(ms: number, text = 'slow answer'): CompleteFn
     });
 }
 
-/** Resolves with a TimeoutError only once the request signal aborts. */
+/** Resolves only once the request signal aborts, with the cancellation error the
+ * HTTP adapter returns for an orchestrator abort (src/infrastructure/adapters/http.ts). */
 export const resolvesOnAbortOnly: CompleteFn = (request) =>
   new Promise((resolve) => {
-    const fail = (): void => resolve(err(new TimeoutError('aborted', 1)));
+    const fail = (): void =>
+      resolve(err(new ExternalServiceError('Request was cancelled by the orchestrator', 'peer')));
     if (request.signal?.aborted === true) {
       fail();
       return;

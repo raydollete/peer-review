@@ -1,6 +1,6 @@
 import type { TokenUsage } from './peer-response.js';
 
-export type SourceStatus = 'ok' | 'error' | 'unavailable' | 'skipped';
+export type SourceStatus = 'ok' | 'error' | 'unavailable' | 'skipped' | 'cancelled';
 
 export interface QuorumSourceReport {
   readonly name: string;

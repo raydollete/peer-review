@@ -7,7 +7,7 @@ import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
 import type { AgreementEvaluation } from './agreement.js';
 import { markFailed, markOk, markSkipped, seedReport } from './source-reports.js';
 import type { MutableReport } from './source-reports.js';
-import { computeTierBudget, markPendingOutage, signalAbortPromise } from './tier-budget.js';
+import { computeTierBudget, markPendingCancelled, markPendingOutage, signalAbortPromise } from './tier-budget.js';
 import { assembleResult } from './quorum-assemble.js';
 import type { ILogger } from '../../shared/logger/index.js';
 
@@ -217,9 +217,13 @@ export class PeerReviewQuorumUseCase {
     const abortRace = signalAbortPromise(peerSignal, tierAborted);
 
     while (pending.size > 0) {
+      // abortRace goes FIRST: when the signal already fired (e.g. during
+      // `evaluate`), the pending peers have settled with their own cancellation
+      // errors too, and race order makes the abort win rather than recording
+      // those as peer failures.
       const winner = await Promise.race<{ key: number; settled: Settled } | typeof tierAborted>([
-        ...pending.values(),
         abortRace,
+        ...pending.values(),
       ]);
       if (winner === tierAborted) {
         // Global wall hit → terminal: leave stragglers on their seeded "no
@@ -244,6 +248,11 @@ export class PeerReviewQuorumUseCase {
         await this.evaluate(input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         if (state.achieved) {
           // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
+          // Record peers that answered during evaluation first — unless the peer
+          // signal fired meanwhile, so what settled is its own cancellation. The
+          // rest were not needed, not failed: they are itemized as cancelled.
+          await this.drainSettled(pending, inflight, state, peerSignal);
+          markPendingCancelled(inflight, state.reports);
           controller.abort();
           return;
         }
@@ -259,9 +268,11 @@ export class PeerReviewQuorumUseCase {
     pending: Map<number, Promise<{ key: number; settled: Settled }>>,
     inflight: Map<number, PeerSource>,
     state: RunState,
+    signal?: AbortSignal,
   ): Promise<void> {
     const sentinel = Symbol('no-settled-result');
-    while (pending.size > 0) {
+    // Once `signal` fired, what settles is its own cancellation, not an answer.
+    while (pending.size > 0 && signal?.aborted !== true) {
       const winner = await Promise.race<{ key: number; settled: Settled } | typeof sentinel>([
         ...pending.values(),
         Promise.resolve(sentinel),
@@ -322,10 +333,7 @@ export class PeerReviewQuorumUseCase {
     arbiterTimeoutMs: number,
     requiredWeight: number,
   ): Promise<void> {
-    const signal = AbortSignal.any([
-      controllerSignal,
-      AbortSignal.timeout(arbiterTimeoutMs),
-    ]);
+    const signal = AbortSignal.any([controllerSignal, AbortSignal.timeout(arbiterTimeoutMs)]);
     const evaluation = await evaluateAgreement({
       arbiter: { name: this.deps.arbiter.name, client: this.deps.arbiter.client },
       question: input.prompt,

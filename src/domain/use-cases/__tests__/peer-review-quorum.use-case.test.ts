@@ -169,8 +169,88 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(slow.calls).toHaveLength(1);
     expect(slow.calls[0]?.signal?.aborted).toBe(true);
     const slowReport = result.sources.find((s) => s.name === 'slow');
-    expect(slowReport?.status).toBe('error');
+    expect(slowReport?.status).toBe('cancelled');
     expect(slowReport?.agreement).toBeNull();
+    expect(slowReport?.error).toBe('Cancelled: quorum was met before this source responded');
+  });
+
+  // ── stragglers while the arbiter is evaluating ─────────────────────────────
+
+  /** Arbiter that answers `ratings` after `ms`, ignoring abort — a slow evaluation
+   * that the peer signal (deadline or tier budget) can fire during. */
+  function slowArbiter(ms: number, ratings: Record<string, number>) {
+    return makeSource('arbiter', 99, 1, () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          const body = Object.entries(ratings).map(([name, agreement]) => ({ name, agreement }));
+          resolve(ok(peerResponse('arbiter', JSON.stringify({ consensus: 'CONSENSUS', ratings: body }))));
+        }, ms);
+      }),
+    );
+  }
+
+  it('records a peer that settles during an achieving evaluation instead of cancelling it', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'yes'));
+    const late = makeSource('late', 1, 1, resolvesAfterDelay(20));
+    const never = makeSource('never', 1, 1, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, late, never],
+      arbiter: slowArbiter(80, { a: 0.9 }),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+      tierTimeoutMs: { 1: 5000 },
+      arbiterTimeoutMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(result.achieved).toBe(true);
+    const lateReport = result.sources.find((s) => s.name === 'late');
+    expect(lateReport?.status).toBe('ok');
+    expect(lateReport?.agreement).toBeNull(); // answered after the rating, so unrated
+    expect(result.usage.totalTokens).toBe(45); // a + late + arbiter, 15 each
+    expect(result.sources.find((s) => s.name === 'never')?.status).toBe('cancelled');
+  });
+
+  it('a global deadline during evaluation leaves the straggler on its seeded error, unlogged', async () => {
+    const warnings: string[] = [];
+    const a = makeSource('a', 1, 2, answers('a', 'yes'));
+    const straggler = makeSource('straggler', 1, 1, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, straggler],
+      arbiter: slowArbiter(150, { a: 0.2 }),
+      thresholds: { 1: 2 },
+      deadlineMs: 60,
+      tierTimeoutMs: { 1: 5000 },
+      arbiterTimeoutMs: 5000,
+      logger: { warn: (msg: string) => { warnings.push(msg); } },
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    const report = result.sources.find((s) => s.name === 'straggler');
+    expect(report?.status).toBe('error');
+    expect(report?.error).toBe('No response recorded before the run ended');
+    expect(warnings).not.toContain('Peer failed during quorum');
+  });
+
+  it('a tier budget during evaluation marks the straggler outage-shaped', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'yes'));
+    const straggler = makeSource('straggler', 1, 1, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, straggler],
+      arbiter: slowArbiter(150, { a: 0.2 }),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+      tierTimeoutMs: { 1: 60 },
+      arbiterTimeoutMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    const report = result.sources.find((s) => s.name === 'straggler');
+    expect(report?.status).toBe('error');
+    expect(report?.error).toContain('tier budget elapsed — still in flight');
   });
 
   it('caller tier limits escalation and picks that tier threshold', async () => {

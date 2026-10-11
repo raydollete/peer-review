@@ -6,16 +6,16 @@ import { ConfigurationError, type DomainError } from '../errors/index.js';
 export interface MutableReport {
   name: string;
   model: string;
-  status: 'ok' | 'error' | 'unavailable' | 'skipped';
+  status: 'ok' | 'error' | 'unavailable' | 'skipped' | 'cancelled';
   weight: number;
   agreement: number | null;
   error?: string | undefined;
 }
 
 /** A source starts non-ok and only earns "ok" by settling successfully. The
- * seeded reason matters: a source that never settles at all (deadline hit,
- * early abort once quorum is reached) would otherwise report a bare "error"
- * status, which the caller — who sees only this envelope — cannot diagnose. */
+ * seeded reason matters: a source that never settles at all (global deadline
+ * hit) would otherwise report a bare "error" status, which the caller — who
+ * sees only this envelope — cannot diagnose. */
 export function seedReport(source: PeerSource): MutableReport {
   return {
     name: source.name,
@@ -48,4 +48,13 @@ export function markSkipped(report: MutableReport): void {
   report.status = 'skipped';
   report.agreement = null;
   report.error = 'Skipped: excluded as a redundant peer for this request (callerSource/skipLocal)';
+}
+
+/** Still in flight when the quorum was met, so the early-abort cancelled it.
+ * Not a failure — the run no longer needed its vote — so it carries zero quorum
+ * weight and is itemized distinctly from "error" rather than as a degraded peer. */
+export function markCancelled(report: MutableReport): void {
+  report.status = 'cancelled';
+  report.agreement = null;
+  report.error = 'Cancelled: quorum was met before this source responded';
 }
