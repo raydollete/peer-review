@@ -42,9 +42,9 @@ export class AnthropicCompatAdapter implements IPeerClient {
     if (request.systemInstruction !== undefined) {
       body['system'] = request.systemInstruction;
     }
-    if (request.temperature !== undefined) {
-      body['temperature'] = request.temperature;
-    }
+    // `request.temperature` is deliberately not forwarded: current Anthropic models
+    // reject it with HTTP 400 ("`temperature` is deprecated for this model."), which
+    // broke every review whose arbiter is a Claude model.
 
     const result = await this.post('/v1/messages', body, request.signal);
     if (result.isErr()) {

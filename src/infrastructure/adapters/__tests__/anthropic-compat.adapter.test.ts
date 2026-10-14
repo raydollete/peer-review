@@ -53,7 +53,9 @@ describe('AnthropicCompatAdapter', () => {
     const body = JSON.parse(String(init?.body));
     expect(body.system).toBe('be terse');
     expect(body.max_tokens).toBe(2048);
-    expect(body.temperature).toBe(0);
+    // Current Anthropic models reject `temperature` with HTTP 400 ("`temperature` is
+    // deprecated for this model."), so the adapter never forwards it.
+    expect(body).not.toHaveProperty('temperature');
     expect(body.messages).toEqual([
       { role: 'user', content: 'hi' },
       { role: 'assistant', content: 'hello' },
