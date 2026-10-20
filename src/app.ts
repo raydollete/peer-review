@@ -118,7 +118,7 @@ async function main(): Promise<void> {
       logger,
     }),
   );
-  const queryPeerController = new QueryPeerController(new QueryPeerUseCase(sources));
+  const queryPeerController = new QueryPeerController(new QueryPeerUseCase(sources, deadlineMs));
   const listPeersController = new ListPeersController(new ListPeersUseCase(sources));
   const countTokensController = new CountTokensController(new CountTokensUseCase(sources));
 

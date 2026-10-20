@@ -33,7 +33,7 @@ function buildControllers(): {
   });
   return {
     peerReview: new PeerReviewController(quorum),
-    queryPeer: new QueryPeerController(new QueryPeerUseCase(sources)),
+    queryPeer: new QueryPeerController(new QueryPeerUseCase(sources, 5000)),
     listPeers: new ListPeersController(new ListPeersUseCase(sources)),
     countTokens: new CountTokensController(new CountTokensUseCase(sources)),
   };

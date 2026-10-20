@@ -84,7 +84,7 @@ The server reads a JSON config file from `PEER_REVIEW_CONFIG` (default `./peer-r
 | `sources[].local` | bool | no | Marks a source served by the local inference backend. A caller that itself runs on that backend sets [`PEER_REVIEW_SKIP_LOCAL`](#environment-variables) so these sources are dropped from its requests (self-contention, not a second opinion). Locality, not model id. |
 | `sources[].jsonMode` | bool | no | Asks the provider for a JSON-object reply on arbiter evaluations via `response_format`. OpenAI-compatible sources only — startup rejects it on `anthropic`. Off = request bodies unchanged. Set it on the arbiter source once you have confirmed its endpoint accepts `response_format`. |
 
-Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`, a source declaring `jsonMode` with `apiType: "anthropic"`, or a timeout budget that cannot fit every sequential tier wave plus its arbiter evaluation inside `PEER_REVIEW_DEADLINE_MS`. Each wave is sized to its slowest configured peer, then gets a separate arbiter allowance, so the final escalation tier is not silently cut short. Credential material never appears in config, logs, or responses.
+Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` name, a source tier without a threshold, duplicate source names, a source named `caller` (reserved for the [`callerAnswer`](#peer_review) rating channel), a source declaring both or neither of `apiKeyEnv`/`apiKeyCommand`, a source declaring `jsonMode` with `apiType: "anthropic"`, or a timeout budget that cannot fit the first tier's wave plus its arbiter evaluation inside `PEER_REVIEW_DEADLINE_MS`. The first wave is sized to its slowest configured peer, plus a separate arbiter allowance, so a first verdict is always reachable. Higher tiers are not summed: at run time each tier's wave is capped at the time remaining minus one arbiter evaluation, and a tier with no time left is not launched and is itemized `skipped`. Credential material never appears in config, logs, or responses.
 
 ### Environment variables
 
@@ -92,7 +92,7 @@ Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` n
 |---|---|---|
 | `PEER_REVIEW_CONFIG` | `./peer-review.config.json` | Path to the config file. |
 | `PEER_TIMEOUT_MS` | `120000` | Per-source request timeout (includes retries). |
-| `PEER_REVIEW_DEADLINE_MS` | `750000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Each tier’s peer wave gets its configured timeout, followed by a separate arbiter timeout; startup rejects a deadline too small for the full configured sequential path. |
+| `PEER_REVIEW_DEADLINE_MS` | `280000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Must stay below your MCP client's tool-call timeout (300 s for most clients), or the partial result arrives after the caller has given up. Each tier's peer wave gets the smaller of its configured timeout and the time remaining minus the arbiter timeout. Also bounds `query_peer`. |
 | `PEER_REVIEW_SKIP_LOCAL` | `false` | When true (`true`/`1`), every source flagged [`local`](#configuration) is excluded from the quorum for this server registration. Set it per-caller in that caller's MCP registration `env` when the caller itself runs on the local backend, so it does not contend with itself. The class-wide sibling of the per-request [`callerSource`](#peer_review) skip. |
 | `PEER_MAX_OUTPUT_TOKENS` | `8192` | Max output tokens injected server-side into every peer call. |
 | `PEER_CREDENTIAL_TTL_S` | `3000` | Cache TTL (seconds) for tokens minted via `apiKeyCommand`. |
@@ -321,7 +321,7 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
 A third, slower tier-1 peer that was still answering when `gemini-a` and `gemini-b` met the bar would appear alongside them as:
 
 ```jsonc
-{ "name": "slow-reasoner", "model": "deepseek-flash", "status": "cancelled", "weight": 1, "agreement": null }
+{ "name": "slow-reasoner", "model": "glm-flash", "status": "cancelled", "weight": 1, "agreement": null }
 ```
 
 `sources[].status` is `ok`, `error`, `unavailable`, `skipped` (excluded from this request via `callerSource`/`PEER_REVIEW_SKIP_LOCAL` — never called, zero quorum weight), or `cancelled` (still in flight when quorum was met, so the early-abort cancelled it — not a failure, zero quorum weight); `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.

@@ -3,15 +3,15 @@ import type { EnvConfig } from './env.config.js';
 import type { PeerReviewConfig } from './peer-config.js';
 
 /**
- * Startup guard: every configured tier wave plus its arbiter evaluation runs
- * sequentially on an escalated call, so their combined effective timeouts MUST
- * be strictly less than the global deadline.
+ * Startup guard: the first tier wave plus its arbiter evaluation MUST be
+ * strictly less than the global deadline, so a first verdict is always
+ * reachable inside the wall.
  *
  * Effective timeout = a source's per-source `timeoutMs`, else the global
- * `PEER_TIMEOUT_MS` (`env.timeoutMs`). Each tier wave takes its slowest source
- * timeout (the peers run in parallel), then independently needs the arbiter
- * timeout. This guarantees an escalated run can honor every configured source
- * allowance without silently converting the final tier into a budget timeout.
+ * `PEER_TIMEOUT_MS` (`env.timeoutMs`). The first wave takes its slowest source
+ * timeout (the peers run in parallel). Higher tiers are not summed: their
+ * timeouts are ceilings, bounded at run time by the time remaining before the
+ * deadline, never reservations the deadline must cover.
  */
 export function validateTimeoutsAgainstDeadline(config: PeerReviewConfig, env: EnvConfig): void {
   const effective = (timeoutMs: number | undefined): number => timeoutMs ?? env.timeoutMs;
@@ -19,31 +19,23 @@ export function validateTimeoutsAgainstDeadline(config: PeerReviewConfig, env: E
   const arbiterSource = config.sources.find((s) => s.name === config.arbiter);
   // parsePeerConfig already guarantees the arbiter names a configured source.
   const arbiterTimeout = effective(arbiterSource?.timeoutMs);
-  const maxByTier = new Map<number, { timeoutMs: number; sourceName: string }>();
-  for (const source of config.sources) {
+  const firstTier = Math.min(...config.sources.map((s) => s.tier));
+  let slowest = { timeoutMs: 0, sourceName: '' };
+  for (const source of config.sources.filter((s) => s.tier === firstTier)) {
     const t = effective(source.timeoutMs);
-    const current = maxByTier.get(source.tier);
-    if (current === undefined || t > current.timeoutMs) {
-      maxByTier.set(source.tier, { timeoutMs: t, sourceName: source.name });
+    if (t > slowest.timeoutMs) {
+      slowest = { timeoutMs: t, sourceName: source.name };
     }
   }
 
-  const tierBreakdown = [...maxByTier.entries()]
-    .sort(([a], [b]) => a - b)
-    .map(([tier, source]) =>
-      `tier ${tier}: ${source.sourceName} ${source.timeoutMs}ms + arbiter ${arbiterTimeout}ms`,
-    );
-  const requiredDeadlineMs = [...maxByTier.values()].reduce(
-    (total, source) => total + source.timeoutMs + arbiterTimeout,
-    0,
-  );
-
-  if (requiredDeadlineMs >= env.deadlineMs) {
+  if (slowest.timeoutMs + arbiterTimeout >= env.deadlineMs) {
     throw new ConfigurationError(
-      `Timeout budget cannot fit every sequential tier wave plus arbiter: ` +
-        `${tierBreakdown.join('; ')} = ${requiredDeadlineMs}ms is not strictly less than ` +
+      `Timeout budget cannot fit the first tier wave plus arbiter: ` +
+        `tier ${firstTier}: ${slowest.sourceName} ${slowest.timeoutMs}ms + arbiter ${arbiterTimeout}ms = ` +
+        `${slowest.timeoutMs + arbiterTimeout}ms is not strictly less than ` +
         `the deadline (PEER_REVIEW_DEADLINE_MS=${env.deadlineMs}ms). ` +
-        `Lower a per-source timeoutMs / PEER_TIMEOUT_MS, or raise PEER_REVIEW_DEADLINE_MS.`,
+        `Lower PEER_TIMEOUT_MS or the first tier's/arbiter's timeoutMs, or raise PEER_REVIEW_DEADLINE_MS ` +
+        `while keeping it below the MCP client's tool-call timeout.`,
     );
   }
 }

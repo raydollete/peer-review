@@ -175,11 +175,16 @@ describe('env config', () => {
     const { loadEnvConfig } = await import('../env.config.js');
     const env = loadEnvConfig({});
     expect(env.timeoutMs).toBe(120000);
-    expect(env.deadlineMs).toBe(750000);
+    expect(env.deadlineMs).toBe(280000);
     expect(env.maxOutputTokens).toBe(8192);
     expect(env.credentialTtlS).toBe(3000);
     expect(env.logLevel).toBe('info');
     expect(env.configPath).toBe('./peer-review.config.json');
+  });
+
+  it('defaults the deadline below the 300 s MCP tool-call timeout', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    expect(loadEnvConfig({}).deadlineMs).toBeLessThan(300000);
   });
 
   it('coerces numeric overrides and rejects garbage', async () => {
@@ -206,57 +211,47 @@ describe('timeout-vs-deadline startup guard', () => {
     validateTimeoutsAgainstDeadline(parsePeerConfig(rawConfig), loadEnvConfig(env));
   }
 
-  it('throws when sequential tier waves plus arbitration cannot fit the deadline', async () => {
+  it('throws when the first tier wave plus arbiter cannot fit the deadline', async () => {
     const config = clone();
-    // tier 1: 120000 + 120000; tier 2: 400000 + 120000 = 760000.
-    config.sources[1]!['timeoutMs'] = 400000;
+    config.sources[0]!['timeoutMs'] = 160000; // alpha: tier 1 and arbiter → 160000 + 160000
     await expect(
-      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '280000' }),
     ).rejects.toThrow(ConfigurationError);
   });
 
-  it('names the tier allocations, arbiter timeout, and deadline', async () => {
+  it('names the first-tier timeout, arbiter timeout, and deadline', async () => {
     const config = clone();
-    config.sources[1]!['timeoutMs'] = 400000;
-    await expect(
-      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
-    ).rejects.toThrow(/tier 1.*120000.*tier 2.*400000.*120000.*480000/s);
-  });
-
-  it('passes when every sequential wave plus arbiter fits within the deadline', async () => {
-    const config = clone();
-    config.sources[1]!['timeoutMs'] = 200000; // (120000 + 120000) + (200000 + 120000) < 750000
-    await expect(
-      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '750000' }),
-    ).resolves.toBeUndefined();
-  });
-
-  it('rejects the Kimi-shaped 480000ms deadline as too short for full escalation', async () => {
-    const config = clone();
-    config.sources[0]!['timeoutMs'] = 120000; // arbiter
-    config.sources[1]!['timeoutMs'] = 300000;
     config.sources.push({
-      name: 'deepseek',
+      name: 'gamma',
       apiType: 'openai',
       baseUrl: 'https://api.example.com/v1',
       model: 'model-c',
-      apiKeyEnv: 'DEEPSEEK_KEY',
+      apiKeyEnv: 'GAMMA_KEY',
       weight: 1,
       tier: 1,
-      timeoutMs: 180000,
+      timeoutMs: 200000,
     });
     await expect(
-      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '480000' }),
-    ).rejects.toThrow(/720000.*480000/s);
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '280000' }),
+    ).rejects.toThrow(/tier 1: gamma 200000ms \+ arbiter 120000ms.*280000ms.*below the MCP client's tool-call timeout/s);
   });
 
-  it('accepts the shipped default config under default env', async () => {
+  it('boots the live-shaped stack: higher-tier timeouts are not summed', async () => {
+    const config = clone();
+    config.sources[0]!['timeoutMs'] = 120000; // tier 1 and arbiter
+    config.sources[1]!['timeoutMs'] = 300000; // tier 2, above the remaining budget
+    await expect(
+      validate(config, { PEER_TIMEOUT_MS: '120000', PEER_REVIEW_DEADLINE_MS: '280000' }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('accepts the example config under default env', async () => {
     const { loadPeerConfig, loadEnvConfig } = await import('../index.js');
     const { validateTimeoutsAgainstDeadline } = await import('../validate-timeouts.js');
-    // tier 1: 180000 + 120000; tier 2: 300000 + 120000 = 720000 < 750000.
+    // first wave: slowest tier-1 source + arbiter < the default deadline.
     expect(() =>
       validateTimeoutsAgainstDeadline(
-        loadPeerConfig('./peer-review.config.json'),
+        loadPeerConfig('./peer-review.config.example.json'),
         loadEnvConfig({}),
       ),
     ).not.toThrow();

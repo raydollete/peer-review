@@ -10,14 +10,22 @@ export interface QueryPeerInput {
 }
 
 export class QueryPeerUseCase {
-  constructor(private readonly sources: readonly PeerSource[]) {}
+  constructor(
+    private readonly sources: readonly PeerSource[],
+    /** The global deadline: a source's own timeoutMs may exceed it. */
+    private readonly deadlineMs: number,
+  ) {}
 
   async execute(input: QueryPeerInput): Promise<Result<PeerResponse, DomainError>> {
     const source = resolveSource(this.sources, input.source);
     if (source.isErr()) {
       return err(source.error);
     }
-    return source.value.client.complete({ prompt: input.prompt, history: input.history });
+    return source.value.client.complete({
+      prompt: input.prompt,
+      history: input.history,
+      signal: AbortSignal.timeout(this.deadlineMs),
+    });
   }
 }
 

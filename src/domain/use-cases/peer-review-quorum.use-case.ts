@@ -3,12 +3,18 @@ import type { HistoryTurn, PeerResponse, QuorumResult } from '../entities/index.
 import type { PeerSource } from '../ports/index.js';
 import { ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
 import type { DomainError } from '../errors/index.js';
-import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
 import type { AgreementEvaluation } from './agreement.js';
-import { markFailed, markOk, markSkipped, seedReport } from './source-reports.js';
+import { markFailed, markOk, markSkipped, markTierSkippedForTime, seedReport } from './source-reports.js';
 import type { MutableReport } from './source-reports.js';
-import { computeTierBudget, markPendingCancelled, markPendingOutage, signalAbortPromise } from './tier-budget.js';
+import {
+  computeTierBudget,
+  markPendingCancelled,
+  markPendingOutage,
+  MIN_TIER_BUDGET_MS,
+  signalAbortPromise,
+} from './tier-budget.js';
 import { assembleResult } from './quorum-assemble.js';
+import { evaluateRun } from './quorum-evaluate.js';
 import type { ILogger } from '../../shared/logger/index.js';
 
 export interface QuorumInput {
@@ -50,6 +56,8 @@ export interface RunState {
   arbiterFailed: boolean;
   evaluatedCount: number;
   deadlineHit: boolean;
+  /** Highest tier launched so far — read at the wall too, before the run returns. */
+  reachedTier: number;
 }
 interface Settled {
   readonly source: PeerSource;
@@ -92,6 +100,7 @@ export class PeerReviewQuorumUseCase {
       arbiterFailed: false,
       evaluatedCount: 0,
       deadlineHit: false,
+      reachedTier: targetTier,
     };
     const controller = new AbortController();
     const start = Date.now();
@@ -99,15 +108,21 @@ export class PeerReviewQuorumUseCase {
       state.deadlineHit = true;
       controller.abort();
     }, this.deps.deadlineMs);
+    // Preemptive wall: the controller aborts only at the deadline or on an
+    // early-abort (after which the run just unwinds), so the reply returns from
+    // the accumulated state even when an await inside the run ignores the abort.
+    const wall = signalAbortPromise(controller.signal, undefined);
 
-    let reachedTier = targetTier;
     try {
-      reachedTier = await this.runTiers(tiers, targetTier, requiredWeight, input, state, controller, start);
+      await Promise.race([
+        this.runTiers(tiers, targetTier, requiredWeight, input, state, controller, start),
+        wall,
+      ]);
     } finally {
       clearTimeout(timer);
       controller.abort();
     }
-    return assembleResult(input, state, reachedTier, requiredWeight);
+    return assembleResult(input, state, state.reachedTier, requiredWeight);
   }
 
   /**
@@ -124,8 +139,7 @@ export class PeerReviewQuorumUseCase {
     state: RunState,
     controller: AbortController,
     start: number,
-  ): Promise<number> {
-    let reachedTier = targetTier;
+  ): Promise<void> {
     for (const tier of tiers) {
       // Hold the ceiling on a DISAGREEMENT-shaped miss (everyone answered,
       // attainable weight already meets the bar — revisable, no escalation).
@@ -139,12 +153,26 @@ export class PeerReviewQuorumUseCase {
       ) {
         break;
       }
-      reachedTier = tier;
       const tiersRemaining = tiers.length - tiers.indexOf(tier);
+      const elapsedMs = Date.now() - start;
       const fallbackTierBudget = computeTierBudget(
-        this.deps.deadlineMs, Date.now() - start, tiersRemaining, 0,
+        this.deps.deadlineMs, elapsedMs, tiersRemaining, 0,
       );
-      const peerTimeoutMs = this.deps.tierTimeoutMs?.[tier] ?? fallbackTierBudget;
+      // Every wave ends in time for one arbiter evaluation before the wall. The
+      // test-only fallback reserves nothing, as its tier budget already does.
+      const remainingBudget = computeTierBudget(
+        this.deps.deadlineMs, elapsedMs, 1, this.deps.arbiterTimeoutMs ?? 0,
+      );
+      if (remainingBudget === MIN_TIER_BUDGET_MS) {
+        // No time left: send nothing (a request may be billed) and itemize the
+        // tier as skipped rather than misreport healthy sources as outages.
+        markTierSkippedForTime(this.deps.sources.filter((s) => s.tier === tier), state.reports);
+        break;
+      }
+      state.reachedTier = tier;
+      const peerTimeoutMs = Math.min(
+        this.deps.tierTimeoutMs?.[tier] ?? fallbackTierBudget, remainingBudget,
+      );
       const arbiterTimeoutMs = this.deps.arbiterTimeoutMs ?? fallbackTierBudget;
       const peerSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(peerTimeoutMs)]);
       await this.runTier(tier, input, state, controller, requiredWeight, peerSignal, arbiterTimeoutMs);
@@ -152,7 +180,6 @@ export class PeerReviewQuorumUseCase {
         break;
       }
     }
-    return reachedTier;
   }
 
   private launchTier(
@@ -230,8 +257,13 @@ export class PeerReviewQuorumUseCase {
         // response recorded" report, exactly as before. Tier budget hit (global
         // NOT hit) → mark the still-in-flight sources outage-shaped so their
         // weight is unattainable within budget, then return to escalate.
-        if (!state.deadlineHit) {
-          markPendingOutage(inflight, state.reports);
+        if (state.deadlineHit) {
+          return;
+        }
+        const kept = await this.keepSettledAnswers(pending, inflight, state);
+        markPendingOutage(inflight, state.reports);
+        if (kept && this.quorumPossible(state, requiredWeight)) {
+          await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         }
         return;
       }
@@ -245,7 +277,7 @@ export class PeerReviewQuorumUseCase {
         return;
       }
       if (!state.achieved && pending.size > 0 && this.quorumPossible(state, requiredWeight)) {
-        await this.evaluate(input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
+        await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         if (state.achieved) {
           // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
           // Record peers that answered during evaluation first — unless the peer
@@ -260,8 +292,30 @@ export class PeerReviewQuorumUseCase {
     }
 
     if (!state.achieved && !state.deadlineHit && state.successes.length > state.evaluatedCount) {
-      await this.evaluate(input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
+      await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
     }
+  }
+
+  /** A tier slice ended while an evaluation outlasted it: keep every peer that
+   * already answered — only an ok() result is an answer; a settled error is the
+   * abort's own. Returns whether any answer was kept. */
+  private async keepSettledAnswers(
+    pending: Map<number, Promise<{ key: number; settled: Settled }>>,
+    inflight: Map<number, PeerSource>,
+    state: RunState,
+  ): Promise<boolean> {
+    const sentinel = Symbol('not-settled');
+    let kept = false;
+    for (const [key, promise] of pending) {
+      const winner = await Promise.race([promise, Promise.resolve(sentinel)]);
+      if (winner !== sentinel && winner.settled.result.isOk()) {
+        pending.delete(key);
+        inflight.delete(key);
+        this.record(state, winner.settled);
+        kept = true;
+      }
+    }
+    return kept;
   }
 
   private async drainSettled(
@@ -323,51 +377,6 @@ export class PeerReviewQuorumUseCase {
         status: report.status,
         error: settled.result.error.message,
       });
-    }
-  }
-
-  private async evaluate(
-    input: QuorumInput,
-    state: RunState,
-    controllerSignal: AbortSignal,
-    arbiterTimeoutMs: number,
-    requiredWeight: number,
-  ): Promise<void> {
-    const signal = AbortSignal.any([controllerSignal, AbortSignal.timeout(arbiterTimeoutMs)]);
-    const evaluation = await evaluateAgreement({
-      arbiter: { name: this.deps.arbiter.name, client: this.deps.arbiter.client },
-      question: input.prompt,
-      responses: state.successes.map((s) => s.response),
-      callerAnswer: input.callerAnswer,
-      signal,
-      logger: this.deps.logger,
-    });
-    if (evaluation.isErr()) {
-      state.arbiterFailed = true;
-      return;
-    }
-    state.arbiterFailed = false;
-    state.lastEval = evaluation.value;
-    state.evaluatedCount = state.successes.length;
-    state.usage.promptTokens += evaluation.value.usage.promptTokens;
-    state.usage.completionTokens += evaluation.value.usage.completionTokens;
-    state.usage.totalTokens += evaluation.value.usage.totalTokens;
-
-    let agreeing = 0;
-    for (const success of state.successes) {
-      const rating =
-        evaluation.value.ratings.find((r) => r.name === success.source.name)?.agreement ?? 0;
-      const report = state.reports.get(success.source.name);
-      if (report !== undefined) {
-        report.agreement = rating;
-      }
-      if (rating >= AGREEMENT_THRESHOLD) {
-        agreeing += success.source.weight;
-      }
-    }
-    state.agreeingWeight = agreeing;
-    if (agreeing >= requiredWeight) {
-      state.achieved = true;
     }
   }
 }

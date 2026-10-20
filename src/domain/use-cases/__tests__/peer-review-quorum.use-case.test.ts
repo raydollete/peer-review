@@ -151,6 +151,26 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(arbiter.calls).toHaveLength(0);
   });
 
+  it('returns at the deadline even when the arbiter ignores the abort', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'x'));
+    const arbiter = makeSource('arbiter', 99, 1, () => new Promise(() => undefined));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 100,
+    });
+
+    const started = Date.now();
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(arbiter.calls).toHaveLength(1);
+    expect(result.achieved).toBe(false);
+    expect(result.tier).toBe(1);
+    expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
+  });
+
   it('early-aborts pending same-tier calls once quorum weight is met', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'yes'));
     const b = makeSource('b', 1, 2, answers('b', 'yes'));
@@ -198,8 +218,8 @@ describe('PeerReviewQuorumUseCase', () => {
       arbiter: slowArbiter(80, { a: 0.9 }),
       thresholds: { 1: 2 },
       deadlineMs: 5000,
-      tierTimeoutMs: { 1: 5000 },
-      arbiterTimeoutMs: 5000,
+      tierTimeoutMs: { 1: 3000 },
+      arbiterTimeoutMs: 1000,
     });
 
     const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
@@ -221,8 +241,8 @@ describe('PeerReviewQuorumUseCase', () => {
       arbiter: slowArbiter(150, { a: 0.2 }),
       thresholds: { 1: 2 },
       deadlineMs: 60,
-      tierTimeoutMs: { 1: 5000 },
-      arbiterTimeoutMs: 5000,
+      tierTimeoutMs: { 1: 30 },
+      arbiterTimeoutMs: 20,
       logger: { warn: (msg: string) => { warnings.push(msg); } },
     });
 
@@ -243,7 +263,7 @@ describe('PeerReviewQuorumUseCase', () => {
       thresholds: { 1: 2 },
       deadlineMs: 5000,
       tierTimeoutMs: { 1: 60 },
-      arbiterTimeoutMs: 5000,
+      arbiterTimeoutMs: 1000,
     });
 
     const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
@@ -251,6 +271,41 @@ describe('PeerReviewQuorumUseCase', () => {
     const report = result.sources.find((s) => s.name === 'straggler');
     expect(report?.status).toBe('error');
     expect(report?.error).toContain('tier budget elapsed — still in flight');
+  });
+
+  it('keeps a peer that answered inside its slice while an evaluation outlasted it', async () => {
+    const a = makeSource('a', 1, 2, resolvesAfterDelay(100, 'a answer'));
+    const b = makeSource('b', 1, 1, resolvesAfterDelay(400, 'b answer'));
+    const never = makeSource('never', 1, 1, resolvesOnAbortOnly);
+    // First evaluation runs 100–700 ms, past the 500 ms slice; the second is instant.
+    let arbiterCall = 0;
+    const arbiter = makeSource('arbiter', 99, 1, () => {
+      arbiterCall += 1;
+      const ratings = arbiterCall === 1 ? { a: 0.2 } : { a: 0.9, b: 0.9 };
+      const body = Object.entries(ratings).map(([name, agreement]) => ({ name, agreement }));
+      const reply = ok(peerResponse('arbiter', JSON.stringify({ consensus: 'CONSENSUS', ratings: body })));
+      return arbiterCall === 1
+        ? new Promise((resolve) => setTimeout(() => resolve(reply), 600))
+        : Promise.resolve(reply);
+    });
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, never],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+      tierTimeoutMs: { 1: 500 },
+      arbiterTimeoutMs: 1000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    const bReport = result.sources.find((s) => s.name === 'b');
+    expect(bReport?.status).toBe('ok');
+    expect(bReport?.agreement).toBe(0.9);
+    expect(arbiter.calls).toHaveLength(2);
+    expect(result.achieved).toBe(true);
+    expect(result.agreeingWeight).toBe(3);
+    expect(result.sources.find((s) => s.name === 'never')?.error).toContain('tier budget elapsed');
   });
 
   it('caller tier limits escalation and picks that tier threshold', async () => {
@@ -646,6 +701,83 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(result.sources.find((s) => s.name === 'kimi')?.status).toBe('ok');
     expect(result.achieved).toBe(true);
     expect(result.tier).toBe(2);
+  });
+
+  // ── final tier capped by the remaining deadline (280 s wall, 1000:1 scale) ──
+
+  it('caps a final-tier peer at the remaining deadline minus the arbiter reserve', async () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const c = makeSource('c', 2, 1, answers('c', 'x'));
+    const opus = makeSource('opus', 2, 2, resolvesOnAbortOnly);
+    const arbiter = makeArbiter([{ a: 1 }, { a: 1, c: 0.2 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, c, opus],
+      arbiter,
+      thresholds: { 1: 2, 2: 2 },
+      deadlineMs: 280,
+      tierTimeoutMs: { 1: 120, 2: 300 },
+      arbiterTimeoutMs: 120,
+    });
+
+    const started = Date.now();
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+    const elapsed = Date.now() - started;
+
+    // The tier-2 wave ends at 280 − 120 = 160, leaving the arbiter its reserve.
+    expect(elapsed).toBeLessThan(250);
+    expect(arbiter.calls).toHaveLength(2); // the arbiter rated what arrived
+    expect(result.sources.find((s) => s.name === 'c')?.agreement).toBe(0.2);
+    expect(result.achieved).toBe(false);
+    expect(result.tier).toBe(2);
+    const opusReport = result.sources.find((s) => s.name === 'opus');
+    expect(opusReport?.status).toBe('error');
+    expect(opusReport?.error).toContain('tier budget elapsed');
+  });
+
+  it('rates a final-tier peer that answers inside its capped slice', async () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const c = makeSource('c', 2, 1, answers('c', 'x'));
+    const opus = makeSource('opus', 2, 2, resolvesAfterDelay(100, 'opus answer'));
+    const arbiter = makeArbiter([{ a: 1 }, { a: 1, c: 1, opus: 1 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, c, opus],
+      arbiter,
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 280,
+      tierTimeoutMs: { 1: 120, 2: 300 },
+      arbiterTimeoutMs: 120,
+    });
+
+    const started = Date.now();
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(Date.now() - started).toBeLessThan(280);
+    expect(result.sources.find((s) => s.name === 'opus')?.status).toBe('ok');
+    expect(result.achieved).toBe(true);
+    expect(result.tier).toBe(2);
+  });
+
+  it('skips a tier with no time left after the arbiter reserve', async () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const opus = makeSource('opus', 2, 2, answers('opus', 'x'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, opus],
+      // Tier 1's evaluation runs to 200, so 280 − 200 − 120 leaves tier 2 nothing.
+      arbiter: slowArbiter(200, { a: 1 }),
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 280,
+      tierTimeoutMs: { 1: 120, 2: 300 },
+      arbiterTimeoutMs: 120,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(opus.calls).toHaveLength(0);
+    const opusReport = result.sources.find((s) => s.name === 'opus');
+    expect(opusReport?.status).toBe('skipped');
+    expect(opusReport?.error).toBe('Skipped: no time left before the deadline after the arbiter reserve');
+    expect(result.achieved).toBe(false);
+    expect(result.tier).toBe(1);
   });
 
   it('preserves a tier-1 success and re-evaluates it after a straggler forces escalation', async () => {

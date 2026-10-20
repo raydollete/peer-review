@@ -2,7 +2,7 @@ import { QueryPeerUseCase } from '../query-peer.use-case.js';
 import { ListPeersUseCase } from '../list-peers.use-case.js';
 import { CountTokensUseCase } from '../count-tokens.use-case.js';
 import { ValidationError } from '../../errors/index.js';
-import { makeSource, answers } from './helpers.js';
+import { makeSource, answers, resolvesOnAbortOnly } from './helpers.js';
 
 const heavy1 = makeSource('heavy1', 1, 3, answers('heavy1', 'from heavy1'));
 const light1 = makeSource('light1', 1, 1, answers('light1', 'from light1'));
@@ -11,17 +11,26 @@ const sources = [tier2, light1, heavy1];
 
 describe('QueryPeerUseCase', () => {
   it('defaults to the lowest-tier highest-weight source', async () => {
-    const result = await new QueryPeerUseCase(sources).execute({ prompt: 'q' });
+    const result = await new QueryPeerUseCase(sources, 5000).execute({ prompt: 'q' });
     expect(result._unsafeUnwrap().source).toBe('heavy1');
   });
 
   it('uses the named source when given', async () => {
-    const result = await new QueryPeerUseCase(sources).execute({ prompt: 'q', source: 'tier2' });
+    const result = await new QueryPeerUseCase(sources, 5000).execute({ prompt: 'q', source: 'tier2' });
     expect(result._unsafeUnwrap().source).toBe('tier2');
   });
 
+  it('aborts a source that outlasts the deadline and returns its error', async () => {
+    const slow = makeSource('slow', 1, 1, resolvesOnAbortOnly);
+    const started = Date.now();
+    const result = await new QueryPeerUseCase([slow], 50).execute({ prompt: 'q' });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(slow.calls[0]?.signal?.aborted).toBe(true);
+    expect(result.isErr()).toBe(true);
+  });
+
   it('rejects an unknown source name with ValidationError', async () => {
-    const result = await new QueryPeerUseCase(sources).execute({ prompt: 'q', source: 'nope' });
+    const result = await new QueryPeerUseCase(sources, 5000).execute({ prompt: 'q', source: 'nope' });
     expect(result._unsafeUnwrapErr()).toBeInstanceOf(ValidationError);
   });
 });

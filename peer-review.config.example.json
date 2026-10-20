@@ -3,16 +3,6 @@
   "arbiter": "gemini-flash",
   "sources": [
     {
-      "name": "deepseek-flash",
-      "apiType": "openai",
-      "baseUrl": "https://api.deepseek.com",
-      "model": "deepseek-v4-flash",
-      "apiKeyEnv": "DEEPSEEK_API_KEY",
-      "weight": 1,
-      "tier": 1,
-      "timeoutMs": 180000
-    },
-    {
       "name": "gemini-flash",
       "apiType": "openai",
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",

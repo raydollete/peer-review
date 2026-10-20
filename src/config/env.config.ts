@@ -4,11 +4,11 @@ import { ConfigurationError } from '../shared/errors/index.js';
 const EnvSchema = z.object({
   PEER_REVIEW_CONFIG: z.string().min(1).default('./peer-review.config.json'),
   PEER_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
-  // A tier-2 escalation runs tier-1 wave + arbiter + tier-2 wave + arbiter
-  // sequentially against this one deadline; reasoning-model latency does not
-  // fit in the 720s worst-case configured path; the 750s default leaves a
-  // small outer-wall margin.
-  PEER_REVIEW_DEADLINE_MS: z.coerce.number().int().positive().default(750000),
+  // Must stay strictly below the MCP client's tool-call timeout (300 s under
+  // radflow, Codex, and omp) so the partial result reaches a caller still
+  // waiting; 280 s leaves ~20 s for transport and serialization. Escalated
+  // tiers get whatever time remains.
+  PEER_REVIEW_DEADLINE_MS: z.coerce.number().int().positive().default(280000),
   PEER_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8192),
   PEER_CREDENTIAL_TTL_S: z.coerce.number().int().positive().default(3000),
   // When true, sources flagged `local` in config are excluded from the quorum —

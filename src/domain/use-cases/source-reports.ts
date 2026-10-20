@@ -44,10 +44,26 @@ export function markFailed(report: MutableReport, error: DomainError): void {
  * (`skipLocal`); both can hold at once. Never called, zero quorum weight, but
  * itemized so the exclusion is transparent rather than a silent gap in
  * `sources[]`. */
-export function markSkipped(report: MutableReport): void {
+export function markSkipped(
+  report: MutableReport,
+  reason = 'Skipped: excluded as a redundant peer for this request (callerSource/skipLocal)',
+): void {
   report.status = 'skipped';
   report.agreement = null;
-  report.error = 'Skipped: excluded as a redundant peer for this request (callerSource/skipLocal)';
+  report.error = reason;
+}
+
+/** Escalation reached a tier with no time left before the deadline after the
+ * arbiter reserve: none of its sources is called, each itemized as skipped. */
+export function markTierSkippedForTime(
+  sources: readonly PeerSource[],
+  reports: Map<string, MutableReport>,
+): void {
+  for (const source of sources) {
+    const report = seedReport(source);
+    markSkipped(report, 'Skipped: no time left before the deadline after the arbiter reserve');
+    reports.set(source.name, report);
+  }
 }
 
 /** Still in flight when the quorum was met, so the early-abort cancelled it.
