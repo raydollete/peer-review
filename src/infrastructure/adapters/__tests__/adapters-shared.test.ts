@@ -8,13 +8,15 @@ import {
   TimeoutError,
   ExternalServiceError,
 } from '../../../shared/errors/index.js';
-import { PeerApiError, PeerRateLimitError } from '../../../domain/errors/index.js';
+import { PeerApiError, PeerRateLimitError, CredentialError, TransportError } from '../../../domain/errors/index.js';
+import { failureFields } from '../../controllers/failure-fields.js';
 import {
   StubCredentialProvider,
   FailingCredentialProvider,
   jsonResponse,
   instantDeps,
 } from './test-helpers.js';
+import type { CredentialProvider } from '../../../domain/ports/index.js';
 
 function call(
   fetchFn: typeof fetch,
@@ -342,5 +344,62 @@ describe('adapter factory', () => {
     expect(JSON.parse(String(defaultFetch.mock.calls[0]![1]?.body))).not.toHaveProperty(
       'response_format',
     );
+  });
+});
+
+describe('transport cause + redaction (tasks 6, 9, 16)', () => {
+  async function wireError(
+    fetchFn: typeof fetch,
+    credentialProvider: CredentialProvider = new StubCredentialProvider('key-1', 'key-2'),
+  ): Promise<DomainError> {
+    const result = await postJson(
+      {
+        url: 'https://peer.test/v1/chat',
+        headers: () => ({}),
+        body: {},
+        timeoutMs: 1000,
+        maxRetries: 0,
+        retryBaseMs: 10,
+        serviceName: 'test-source',
+        credentialProvider,
+      },
+      instantDeps(fetchFn),
+    );
+    return result._unsafeUnwrapErr();
+  }
+
+  function fetchRejecting(cause: Record<string, unknown>): typeof fetch {
+    return jest.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause }));
+  }
+
+  it('names the unwrapped errno, distinct per transport failure (task 6)', async () => {
+    const refused = await wireError(fetchRejecting({ code: 'ECONNREFUSED' }));
+    const dns = await wireError(fetchRejecting({ code: 'ENOTFOUND' }));
+    expect(refused).toBeInstanceOf(TransportError);
+    expect((refused as TransportError).errno).toBe('ECONNREFUSED');
+    const refusedFields = failureFields(refused);
+    const dnsFields = failureFields(dns);
+    expect(refusedFields.cause).toBe('peer_unreachable');
+    expect(refusedFields.detail).toContain('ECONNREFUSED');
+    expect(refusedFields.detail).toContain('test-source');
+    expect(dnsFields.detail).toContain('ENOTFOUND');
+    expect(refusedFields.detail).not.toEqual(dnsFields.detail);
+  });
+
+  it('never surfaces a 401 response body fragment in the error or wire fields (tasks 9a, 16)', async () => {
+    const fetchFn = jest
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { message: 'invalid api key sk-LEAKEDbody99', api_key: 'sk-LEAKEDbody99' } },
+          401,
+        ),
+      );
+    const provider = new StubCredentialProvider('key-1', 'key-2');
+    const error = await wireError(fetchFn, provider);
+    expect(error).toBeInstanceOf(CredentialError);
+    expect(error.message).not.toContain('sk-LEAKEDbody99');
+    expect(JSON.stringify(failureFields(error))).not.toContain('sk-LEAKEDbody99');
+    expect(JSON.stringify(error)).not.toContain('sk-LEAKEDbody99');
   });
 });

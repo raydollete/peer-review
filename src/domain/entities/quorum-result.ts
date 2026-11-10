@@ -1,6 +1,47 @@
+import type { PeerReviewFailureCause } from '../errors/failure-cause.js';
 import type { TokenUsage } from './peer-response.js';
 
 export type SourceStatus = 'ok' | 'error' | 'unavailable' | 'skipped' | 'cancelled';
+
+/** The arbiter's preserved failure, recorded on the run state at evaluation
+ * time (type alias, not interface, so it stays assignable to a wire record). */
+export type ArbiterErrorRecord = {
+  readonly code: string;
+  readonly cause: PeerReviewFailureCause;
+  readonly source: string;
+  readonly detail: string;
+};
+
+/** The wire shape of an arbiter failure row: `{name, status, error}`. */
+export type ArbiterReport = {
+  readonly name: string;
+  readonly status: 'failed';
+  readonly error: {
+    readonly code: string;
+    readonly cause: PeerReviewFailureCause;
+    readonly detail: string;
+  };
+};
+
+/** The per-source roster plus the weight math, carried on every `success: false`
+ * `peer_review` response in which at least one source was consulted — mirroring
+ * the success path's `data.quorum` so one shape serves both paths. */
+export type QuorumErrorContext = {
+  readonly tier: number;
+  readonly requiredWeight: number;
+  readonly agreeingWeight: number;
+  readonly arbiter?: ArbiterReport;
+  readonly sources: readonly QuorumSourceReport[];
+};
+
+/** Freeze an `ArbiterErrorRecord` into its wire row. */
+export function arbiterReport(record: ArbiterErrorRecord): ArbiterReport {
+  return {
+    name: record.source,
+    status: 'failed',
+    error: { code: record.code, cause: record.cause, detail: record.detail },
+  };
+}
 
 export interface QuorumSourceReport {
   readonly name: string;
@@ -12,6 +53,16 @@ export interface QuorumSourceReport {
   /** Why a non-ok source failed. Absent when status is "ok" — a bare "error"
    * status is undiagnosable from the caller side, which only sees this envelope. */
   readonly error?: string | undefined;
+  /** Machine cause of this source's failure, from the typed error that produced
+   * it (never prose). Absent for ok/cancelled sources. */
+  readonly cause?: PeerReviewFailureCause | undefined;
+  /** The typed error's coarse wire class, kept beside the cause. */
+  readonly code?: string | undefined;
+  /** The service name a transport/external error named. */
+  readonly service?: string | undefined;
+  /** For a source that timed out: the budget it exceeded, so the caller can
+   * tell which clock expired rather than parsing prose. */
+  readonly timeoutMs?: number | undefined;
 }
 
 export interface QuorumResult {
@@ -34,5 +85,10 @@ export interface QuorumResult {
    * Carries zero quorum weight. */
   readonly callerAgreement?: number | null;
   readonly sources: readonly QuorumSourceReport[];
+  /** Arbiter failure report on the arbiter-fallback success path: what its
+   * name was, that it failed, and the typed cause — never a bare boolean.
+   * Lives only on the success (`data.quorum`) path; the failure path carries
+   * its own copy in `error.context.arbiter`, never the other way around. */
+  readonly arbiter?: ArbiterReport;
   readonly usage: TokenUsage;
 }

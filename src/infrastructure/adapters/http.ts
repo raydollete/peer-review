@@ -1,11 +1,13 @@
 import { ok, err, type Result } from 'neverthrow';
+import { TimeoutError, type DomainError } from '../../shared/errors/index.js';
 import {
-  ConfigurationError,
-  ExternalServiceError,
-  TimeoutError,
-  type DomainError,
-} from '../../shared/errors/index.js';
-import { PeerApiError, PeerRateLimitError } from '../../domain/errors/index.js';
+  PeerApiError,
+  PeerRateLimitError,
+  CredentialError,
+  TransportError,
+  CancellationError,
+  MalformedResponseBodyError,
+} from '../../domain/errors/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 
 export interface HttpDeps {
@@ -49,7 +51,7 @@ function abortPromise(signal: AbortSignal): Promise<void> {
 /** Honest attribution: an external (orchestrator) abort is cancellation, never a
  * source-attributed timeout — a healthy-but-contended source is not scapegoated. */
 function cancelledError(serviceName: string): DomainError {
-  return new ExternalServiceError(
+  return new CancellationError(
     `Request to "${serviceName}" was cancelled by the orchestrator`,
     serviceName,
   );
@@ -88,18 +90,33 @@ export function mapStatusToError(status: number, serviceName: string): DomainErr
     return new PeerRateLimitError();
   }
   if (status === 401 || status === 403) {
-    return new ConfigurationError(`Authentication failed for "${serviceName}" (HTTP ${status})`);
+    return new CredentialError(`Authentication failed for "${serviceName}" (HTTP ${status})`);
   }
   if (status === 404) {
-    return new PeerApiError(`Model or endpoint not found for "${serviceName}"`, 404);
+    return new PeerApiError(`Model or endpoint not found for "${serviceName}"`, 404, serviceName);
   }
-  return new PeerApiError(`Peer API error from "${serviceName}" (HTTP ${status})`, status);
+  return new PeerApiError(`Peer API error from "${serviceName}" (HTTP ${status})`, status, serviceName);
 }
 
 function isAbortError(error: unknown): boolean {
   return (
     error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
   );
+}
+
+/** Unwrap fetch's error.cause for DISPLAY ONLY: the errno (`ECONNREFUSED`,
+ * `ENOTFOUND`, `EAI_AGAIN`, `EPROTO`, `CERT_*`) that names the real transport
+ * failure. Attribution (cancellation vs timeout vs transport) stays driven by
+ * signal state — never re-derived from this chain. */
+function transportCode(error: unknown): string | undefined {
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  if (typeof cause !== 'object' || cause === null) {
+    return undefined;
+  }
+  const coded = cause as { code?: unknown; errno?: unknown };
+  const code = typeof coded.code === 'string' ? coded.code : undefined;
+  const errno = typeof coded.errno === 'string' ? coded.errno : undefined;
+  return code ?? errno;
 }
 
 interface AttemptState {
@@ -151,7 +168,7 @@ async function performFetch(
       }
       return err(new TimeoutError(`Request to "${cfg.serviceName}" was aborted`, cfg.timeoutMs));
     }
-    return err(new ExternalServiceError(`Network error: ${String(error)}`, cfg.serviceName));
+    return err(new TransportError(`Network error: ${String(error)}`, cfg.serviceName, transportCode(error)));
   }
 }
 
@@ -188,13 +205,17 @@ async function readJsonBody(
       );
     }
     return err(
-      new ExternalServiceError(`Network error reading response body: ${String(error)}`, cfg.serviceName),
+      new TransportError(
+        `Network error reading response body: ${String(error)}`,
+        cfg.serviceName,
+        transportCode(error),
+      ),
     );
   }
   try {
     return ok(JSON.parse(text) as unknown);
   } catch {
-    return err(new ExternalServiceError('Response body is not valid JSON', cfg.serviceName));
+    return err(new MalformedResponseBodyError('Response body is not valid JSON', cfg.serviceName));
   }
 }
 

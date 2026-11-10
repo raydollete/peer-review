@@ -1,8 +1,9 @@
+import { ok, err } from 'neverthrow';
 import {
   PeerReviewController,
   QueryPeerController,
-  ListPeersController,
   CountTokensController,
+  ListPeersController,
 } from '../index.js';
 import {
   PeerReviewQuorumUseCase,
@@ -10,10 +11,14 @@ import {
   ListPeersUseCase,
   CountTokensUseCase,
 } from '../../../domain/use-cases/index.js';
+import type { PeerSource } from '../../../domain/entities/index.js';
+import { CredentialError, TransportError } from '../../../domain/errors/index.js';
 import {
+  makeSource as makeSourceWith,
   makeSource,
   makeArbiter,
   answers,
+  resolvesOnAbortOnly,
 } from '../../../domain/use-cases/__tests__/helpers.js';
 
 function buildControllers(): {
@@ -22,8 +27,8 @@ function buildControllers(): {
   listPeers: ListPeersController;
   countTokens: CountTokensController;
 } {
-  const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
-  const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+  const a = makeSourceWith('a', 1, 2, answers('a', 'answer-a'), true, 'openai', 'gpt-a');
+  const b = makeSourceWith('b', 1, 2, answers('b', 'answer-b'), true, 'anthropic', 'opus-x');
   const sources = [a, b];
   const quorum = new PeerReviewQuorumUseCase({
     sources,
@@ -179,5 +184,163 @@ describe('CountTokensController', () => {
     const result = await countTokens.handle({ text: '' });
     expect(result.success).toBe(false);
     expect(result.error?.code).toBe('VALIDATION_ERROR');
+  });
+});
+
+describe('failure envelope forwarding (tasks 4, 5, 14)', () => {
+  const prompt = 'Which transport is best for 500 km cargo, and why?';
+
+  function refusedSource(name: string, weight: number, errno = 'ECONNREFUSED'): PeerSource {
+    return makeSource(name, 1, weight, async () =>
+      err(new TransportError('Network error: TypeError: fetch failed', name, errno)),
+    );
+  }
+
+  function deniedSource(name: string, weight: number): PeerSource {
+    return makeSource(name, 1, weight, async () =>
+      err(new CredentialError(`Authentication failed for "${name}" (HTTP 401)`)),
+    );
+  }
+
+  it('peer_review Err path carries cause, source, fix, and the roster (task 5)', async () => {
+    const refused = refusedSource('refused', 1);
+    const denied = deniedSource('denied', 2);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [refused, denied],
+      arbiter: makeArbiter([{ refused: 0.9, denied: 0.9 }]),
+      thresholds: { 1: 5 },
+      deadlineMs: 5000,
+    });
+    const controller = new PeerReviewController(useCase);
+    const result = await controller.handle({ prompt });
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('EXTERNAL_SERVICE_ERROR');
+    expect(result.error?.message).toBe('No peer source produced a response');
+    expect(result.error?.cause).toBe('credential'); // highest-weight failed source
+    expect(result.error?.source).toBe('denied');
+    expect(typeof result.error?.fix).toBe('string');
+    expect(result.error?.fix).toContain('credential');
+    expect(result.error?.detail).toContain('context.sources');
+    const roster = result.error?.context?.sources as Array<Record<string, unknown>>;
+    expect(roster).toHaveLength(2);
+    expect(roster.find((s) => s.name === 'refused')?.cause).toBe('peer_unreachable');
+    expect(roster.find((s) => s.name === 'refused')?.error).toContain('Network error');
+    expect(roster.find((s) => s.name === 'denied')?.cause).toBe('credential');
+  });
+
+  it('validation failure names the field to fix and keeps code/message (task 5)', async () => {
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [makeSource('a', 1, 1, answers('a', 'x'))],
+      arbiter: makeArbiter([{ a: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = await new PeerReviewController(useCase).handle({ prompt: '' });
+    expect(result.error?.code).toBe('VALIDATION_ERROR');
+    expect(result.error?.cause).toBe('validation');
+    expect(result.error?.fix).toContain('prompt');
+  });
+
+  it('achieved path keeps the pre-change key set at the boundary (task 5)', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter: makeArbiter([{ a: 0.9, b: 0.9 }]),
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+    const result = await new PeerReviewController(useCase).handle({ prompt });
+    expect(Object.keys(result)).toEqual(['success', 'data']);
+    expect(result.error).toBeUndefined();
+    expect(Object.keys(result.data ?? {}).sort()).toEqual([
+      'certaintyScore',
+      'quorum',
+      'response',
+      'tokenUsage',
+    ]);
+    expect(Object.keys(result.data?.quorum ?? {}).sort()).toEqual([
+      'achieved',
+      'agreeingWeight',
+      'requiredWeight',
+      'sources',
+      'tier',
+    ]);
+  });
+
+  it('query_peer unreachable carries cause and names the source (task 14)', async () => {
+    const refused = refusedSource('refused', 1);
+    const controller = new QueryPeerController(new QueryPeerUseCase([refused], 5000));
+    const result = await controller.handle({ source: 'refused', prompt: 'ping' });
+    expect(result.success).toBe(false);
+    expect(result.error?.cause).toBe('peer_unreachable');
+    expect(result.error?.source).toBe('refused');
+    expect(result.error?.detail).toContain('ECONNREFUSED');
+  });
+
+  it('query_peer is bounded by the smaller of deadline and declared ceiling (task 14)', async () => {
+    const slow = makeSource('slow', 1, 1, resolvesOnAbortOnly);
+    const useCase = new QueryPeerUseCase([slow], 5_000_000, 50);
+    const start = Date.now();
+    const result = await useCase.execute({ source: 'slow', prompt: 'ping' });
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(result.isErr()).toBe(true);
+    expect(slow.calls[0]?.signal?.aborted).toBe(true);
+  });
+
+  it('count_tokens failure carries the same members (task 14)', async () => {
+    const base = makeSource('failing', 1, 1, answers('failing', 'x'));
+    const failing: PeerSource = {
+      ...base,
+      client: {
+        ...base.client,
+        countTokens: async () =>
+          err(new TransportError('Network error: fetch failed', 'failing', 'ENOTFOUND')),
+      },
+    };
+    const controller = new CountTokensController(new CountTokensUseCase([failing]));
+    const result = await controller.handle({ source: 'failing', text: 'hello world' });
+    expect(result.success).toBe(false);
+    expect(result.error?.cause).toBe('peer_unreachable');
+    expect(result.error?.source).toBe('failing');
+    expect(result.error?.detail).toContain('ENOTFOUND');
+  });
+
+  it('every consulted source skipped reports a configuration fault, not an outage (task 4)', async () => {
+    const me = makeSource('me', 1, 1, answers('me', 'x'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [me],
+      arbiter: makeArbiter([{ me: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const controller = new PeerReviewController(useCase);
+    const result = await controller.handle({ prompt, callerSource: 'me' });
+    expect(result.error?.cause).toBe('configuration');
+    expect(result.error?.fix).toContain('callerSource');
+    expect((result.error?.context?.sources as Array<Record<string, unknown>>)[0]?.status).toBe('skipped');
+  });
+
+  it('credential mismatch is reported by list_peers while it holds (task 8)', () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'), true, 'openai', 'gpt-a');
+    const useCase = new ListPeersUseCase([a], {
+      deadlineMs: 280000,
+      callerTimeoutMs: 30000,
+      cause: 'configuration',
+      fix: 'lower the deadline, or raise the tool-call timeout in the harness registration',
+    });
+    const listing = useCase.execute();
+    expect(listing.count).toBe(1);
+    expect(listing.callerCeiling?.cause).toBe('configuration');
+    expect(listing.callerCeiling?.fix).toContain('harness registration');
+    expect(listing.callerCeiling?.deadlineMs).toBe(280000);
+    expect(listing.callerCeiling?.callerTimeoutMs).toBe(30000);
+  });
+
+  it('list_peers omits the ceiling warning when the pair is healthy (task 8)', () => {
+    const a = makeSource('a', 1, 1, answers('a', 'x'), true, 'openai', 'gpt-a');
+    const listing = new ListPeersUseCase([a]).execute();
+    expect(listing.callerCeiling).toBeUndefined();
+    expect('callerCeiling' in listing).toBe(false);
   });
 });

@@ -22,10 +22,12 @@ A provider-agnostic MCP (Model Context Protocol) server that asks a **weighted q
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Tools](#tools)
+- [Troubleshooting](#troubleshooting)
 - [Migrating from gemini-for-claude-mcp](#migrating-from-gemini-for-claude-mcp)
 - [Development](#development)
 - [Contributing](#contributing)
 - [License](#license)
+
 
 ## Requirements
 
@@ -92,7 +94,8 @@ Startup fails fast on: an unreadable/invalid config file, an unknown `arbiter` n
 |---|---|---|
 | `PEER_REVIEW_CONFIG` | `./peer-review.config.json` | Path to the config file. |
 | `PEER_TIMEOUT_MS` | `120000` | Per-source request timeout (includes retries). |
-| `PEER_REVIEW_DEADLINE_MS` | `280000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. Must stay below your MCP client's tool-call timeout (300 s for most clients), or the partial result arrives after the caller has given up. Each tier's peer wave gets the smaller of its configured timeout and the time remaining minus the arbiter timeout. Also bounds `query_peer`. |
+| `PEER_REVIEW_DEADLINE_MS` | `280000` | Hard overall deadline for one `peer_review` call; on expiry in-flight calls are aborted and the accumulated (possibly degraded) result is returned. MUST stay strictly below the declared `PEER_REVIEW_CALLER_TIMEOUT_MS` (next row) — above it the caller abandons the call at its own ceiling and reports only its generic timeout, so the partial result arrives after the caller has given up and no verdict anyone computed is read. Each tier's peer wave gets the smaller of its configured timeout and the time remaining minus the arbiter timeout. Also bounds `query_peer`. |
+| `PEER_REVIEW_CALLER_TIMEOUT_MS` | `300000` | Declared MCP client tool-call timeout (ms) — the ceiling this server assumes. The harness registration owner sets the real value (e.g. omp's per-server `timeout` key); `PEER_REVIEW_DEADLINE_MS` must stay strictly below it. A deadline at or above it makes the server warn once at startup and report the mismatch (`cause: configuration`) on `list_peers` and every failure envelope while it holds. |
 | `PEER_REVIEW_SKIP_LOCAL` | `false` | When true (`true`/`1`), every source flagged [`local`](#configuration) is excluded from the quorum for this server registration. Set it per-caller in that caller's MCP registration `env` when the caller itself runs on the local backend, so it does not contend with itself. The class-wide sibling of the per-request [`callerSource`](#peer_review) skip. |
 | `PEER_MAX_OUTPUT_TOKENS` | `8192` | Max output tokens injected server-side into every peer call. |
 | `PEER_CREDENTIAL_TTL_S` | `3000` | Cache TTL (seconds) for tokens minted via `apiKeyCommand`. |
@@ -246,9 +249,11 @@ Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `
     "requiredWeight": 4,
     "agreeingWeight": 3,
     "sources": [
-      { "name": "gemini-flash", "model": "gemini-3-flash-preview", "status": "unavailable", "weight": 1, "agreement": null },
+      { "name": "gemini-flash", "model": "gemini-3-flash-preview", "status": "unavailable", "weight": 1, "agreement": null,
+        "error": "Credential not resolvable; source skipped", "cause": "credential", "code": "CONFIGURATION_ERROR" },
       { "name": "gpt-mini",     "model": "gpt-5-mini",             "status": "ok",          "weight": 1, "agreement": 1 },
-      { "name": "gemini-pro",   "model": "gemini-3-pro",           "status": "unavailable", "weight": 2, "agreement": null },
+      { "name": "gemini-pro",   "model": "gemini-3-pro",           "status": "unavailable", "weight": 2, "agreement": null,
+        "error": "Credential not resolvable; source skipped", "cause": "credential", "code": "CONFIGURATION_ERROR" },
       { "name": "claude",       "model": "claude-fable-5",         "status": "ok",          "weight": 2, "agreement": 0.95 }
     ]
   },
@@ -256,7 +261,7 @@ Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `
 }
 ```
 
-Had the arbiter itself been the casualty (e.g. `OPENAI_API_KEY` missing in this config), no agreement could be evaluated at all and the response would instead carry the highest-weighted successful answer with `"certaintyScore": 0` and `"quorum": { "arbiterFailed": true, ... }`.
+Had the arbiter itself been the casualty (e.g. `OPENAI_API_KEY` missing in this config), no agreement could be evaluated at all and the response would instead carry the highest-weighted successful answer with `"certaintyScore": 0`, `"quorum": { "arbiterFailed": true, ... }`, and a `quorum.arbiter` row `{ "name": …, "status": "failed", "error": { "code": …, "cause": "arbiter_unavailable", "detail": … } }` naming what its failure was. If instead **no source responded at all**, the call is the one `success: false` shape: `error.code: "EXTERNAL_SERVICE_ERROR"`, `error.message: "No peer source produced a response"`, and — since this change — `error.cause` naming the fault class (`credential` when every source is credential-unavailable, `peer_unreachable` when every host refused, `configuration` when every source was skipped) plus the full per-source roster in `error.context.sources[]`; see the [401 walkthrough](#walkthrough-401-from-every-source).
 
 #### 5. Checking your own answer — `callerAnswer` the peers disagree with
 
@@ -292,6 +297,12 @@ You already have an answer and want independent endorsement. The peers never see
 ## Tools
 
 All tools return the envelope `{"success": true, "data": ...}` or `{"success": false, "error": {"code", "message"}}`, JSON-stringified into a single text content block (compatible with the reference Gemini MCP). Error codes: `VALIDATION_ERROR`, `CONFIGURATION_ERROR`, `TIMEOUT_ERROR`, `EXTERNAL_SERVICE_ERROR`, `PEER_API_ERROR`, `PEER_RATE_LIMIT`, `TOOL_NOT_FOUND`, `INTERNAL_ERROR`. Model, temperature, and output limits are injected server-side — the input schemas are strict, so client-supplied `model`/`temperature` are rejected.
+
+**Failure envelopes carry the cause, not just the code.** Alongside `code` and `message` (unchanged), every failure the server can attribute carries `error.cause` from the closed vocabulary in the [Troubleshooting table](#troubleshooting), and where applicable `error.source` (the peer or arbiter at fault), `error.detail` (one provider-agnostic line — HTTP status or the unwrapped transport `errno`, never provider body text or credential material), `error.fix` (the operator action), and, for a `peer_review` failure with at least one source consulted, `error.context` — the same weight math and `sources[]` roster the success path puts in `data.quorum`, so the no-success response is as diagnosable as the success one. An `INTERNAL_ERROR` is the redacted catch-all: its message is always the generic line, and its `error.context.correlationId` points at the full error in the server's stderr log (see the Troubleshooting table). `code` stays the coarse wire class for readers that switch on it; `cause` is what a repair guide should read. When a source fails as the arbiter, `data.quorum.arbiter` (on the arbiter-fallback success path) or `error.context.arbiter` (on the failure path) reports `{name, status: "failed", error: {code, cause, detail}}` — the `certaintyScore: 0` / `arbiterFailed: true` flags keep their exact meaning; a row is added, never moved.
+
+**Changes to `peer-review.config.json` require restarting the server** — it is read once at startup, and credential availability is evaluated at boot.
+
+**Shipped envelope changes require a rebuild and a harness restart** — the harness spawns a long-lived child from `dist/app.js` (`npm run build` emits it), so a new `error.cause`/`fix` envelope reaches callers only after a rebuild and a harness restart or re-registration.
 
 ### `peer_review`
 
@@ -370,6 +381,8 @@ No input. Returns every configured source with availability (`available` = crede
 { "sources": [ { "name": "gpt-large", "apiType": "openai", "model": "gpt-5.2", "weight": 2, "tier": 1, "available": true } ], "count": 1 }
 ```
 
+While `PEER_REVIEW_DEADLINE_MS` is not strictly below the declared `PEER_REVIEW_CALLER_TIMEOUT_MS` — the MCP client tool-call timeout this server assumes — the response also carries `callerCeiling: { "deadlineMs": …, "callerTimeoutMs": …, "cause": "configuration", "fix": "…" }` naming both numbers and the two ways to fix the pair. Above the ceiling the caller abandons the call and reports only its own generic timeout, so no verdict anyone computed is read.
+
 ### `count_tokens`
 
 Input: `text` (1–1000000 chars), optional `source`. Anthropic-compatible sources use the provider's count endpoint (`"method": "api"`); OpenAI-compatible sources use a `ceil(chars/4)` heuristic (`"method": "estimate"`).
@@ -377,6 +390,59 @@ Input: `text` (1–1000000 chars), optional `source`. Anthropic-compatible sourc
 ```jsonc
 { "totalTokens": 42, "model": "claude-fable-5", "source": "claude", "method": "api" }
 ```
+
+## Troubleshooting
+
+### Failure causes
+
+Every attributable failure names `error.cause` from this closed set. Read `cause`, not prose.
+
+| cause | meaning | what to do |
+| --- | --- | --- |
+| `peer_unreachable` | the peer's host refused or failed the connection; `error.detail` names the unwrapped `errno` (`ECONNREFUSED`, `ENOTFOUND`, …) | check the source's `baseUrl` and network reachability from the server host, then retry |
+| `credential` | 401/403 from the provider, or the credential is unset/unmappable | set the credential env var or repair `apiKeyCommand` for the named source in `peer-review.config.json`, then restart the server |
+| `rate_limited` | the provider 429'd through its backoff budget | wait before retrying, or lower the weight/tier of this source |
+| `peer_bad_response` | 404/5xx, or a body that is not valid JSON | check the model name and endpoint for the named source in `peer-review.config.json`, then retry once |
+| `arbiter_unavailable` | the arbiter source could not be reached | check the arbiter source reachability and credentials in `peer-review.config.json` |
+| `arbiter_malformed` | the arbiter answered in prose; JSON extraction failed even after the one re-ask | set `jsonMode` for the arbiter source or choose a JSON-reliable arbiter |
+| `deadline` | the per-source `timeoutMs` or the global wall expired | raise `PEER_REVIEW_DEADLINE_MS` (staying strictly below `PEER_REVIEW_CALLER_TIMEOUT_MS`) or lower the per-source `timeoutMs` |
+| `validation` | a tool argument failed schema validation; `error.fix` names the field | correct the named argument and retry |
+| `configuration` | bad config file or env var, or the ceiling pair is misset | fix the named file or variable, then restart the server |
+| `internal` | unclassified — the redacted catch-all | inspect the peer-review server stderr log for the `correlationId` in `error.context`; rerun with `LOG_LEVEL=debug` |
+
+### Walkthrough: 401 from every source
+
+All peers were consulted and every one answered 401. This is **not** reported as a network outage — `cause` is `credential`, the roster is intact, and no credential material ever appears in a caller-visible field:
+
+```jsonc
+{
+  "success": false,
+  "error": {
+    "code": "EXTERNAL_SERVICE_ERROR",
+    "message": "No peer source produced a response",
+    "cause": "credential",
+    "detail": "No consulted peer source produced a usable response; see error.context.sources[]",
+    "fix": "Set the credential env vars or repair apiKeyCommand for the unavailable sources in peer-review.config.json, then restart the server",
+    "context": {
+      "tier": 1,
+      "requiredWeight": 4,
+      "agreeingWeight": 0,
+      "sources": [
+        { "name": "gpt-large", "model": "gpt-5.2", "status": "unavailable", "weight": 2, "agreement": null,
+          "error": "Authentication failed for \"gpt-large\" (HTTP 401)", "cause": "credential", "code": "CONFIGURATION_ERROR" }
+      ]
+    }
+  }
+}
+```
+
+Set the env vars (or repair `apiKeyCommand`) and **restart the server** — config and credential availability are evaluated once at boot.
+
+### Walkthrough: the caller abandoned a slow review
+
+Symptom: the harness reports its own generic "timed out" and never reads a verdict, while the server logs the completed answer *after* the caller left. Cause: `PEER_REVIEW_DEADLINE_MS` is not strictly below `PEER_REVIEW_CALLER_TIMEOUT_MS` (the declared MCP client tool-call timeout — omp's per-server `timeout` key). Fix either side: lower `PEER_REVIEW_DEADLINE_MS`, or raise the tool-call timeout in the harness registration and keep the declared value equal to it. The server never dies over this pair: it warns once at startup, `list_peers` reports the mismatch (`callerCeiling`, above), and every failure envelope while it holds carries the same fix line.
+
+Per-call server-side logging names the request id, tool, tier, and duration, so "answered after the caller left" is visible in the log rather than guessed.
 
 ## Migrating from gemini-for-claude-mcp
 

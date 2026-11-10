@@ -1,11 +1,13 @@
 import type { PeerReviewQuorumUseCase } from '../../domain/use-cases/index.js';
-import type { QuorumSourceReport } from '../../domain/entities/index.js';
+import type { ArbiterReport } from '../../domain/entities/index.js';
 import { PeerReviewInputSchema } from '../schemas/index.js';
 import {
   successResponse,
   errorResponse,
   type McpToolResponse,
 } from '../../shared/types/index.js';
+import { failureFields } from './failure-fields.js';
+import type { CallerCeiling } from '../../domain/use-cases/index.js';
 
 export interface PeerReviewResponseData {
   readonly response: string;
@@ -22,7 +24,8 @@ export interface PeerReviewResponseData {
     readonly requiredWeight: number;
     readonly agreeingWeight: number;
     readonly arbiterFailed?: boolean;
-    readonly sources: readonly QuorumSourceReport[];
+    /** Arbiter failure row on the arbiter-fallback path: {name, status, error}. */
+    readonly arbiter?: ArbiterReport;
   };
   readonly tokenUsage: {
     readonly prompt: number;
@@ -32,22 +35,33 @@ export interface PeerReviewResponseData {
 }
 
 export class PeerReviewController {
-  constructor(private readonly useCase: PeerReviewQuorumUseCase) {}
+  constructor(
+    private readonly useCase: PeerReviewQuorumUseCase,
+    /** Present only when the declared caller ceiling no longer clears the deadline. */
+    private readonly callerCeiling?: CallerCeiling,
+  ) {}
 
-  async handle(rawInput: unknown): Promise<McpToolResponse<PeerReviewResponseData>> {
+  async handle(
+    rawInput: unknown,
+    callerSignal?: AbortSignal,
+  ): Promise<McpToolResponse<PeerReviewResponseData>> {
     const parsed = PeerReviewInputSchema.safeParse(rawInput);
     if (!parsed.success) {
+      const fields = parsed.error.issues.map((issue) => issue.path.join('.')).join(', ');
       return errorResponse(
         'VALIDATION_ERROR',
         parsed.error.issues.map((issue) => issue.message).join(', '),
+        { cause: 'validation', fix: `Correct the ${fields} argument${fields.includes(',') ? 's' : ''} and retry` },
       );
     }
 
     // Model, temperature, and output limits are injected server-side; the tool
     // input schema is strict so a client cannot smuggle them in.
-    const result = await this.useCase.execute(parsed.data);
+    const result = await this.useCase.execute(parsed.data, callerSignal);
     if (result.isErr()) {
-      return errorResponse(result.error.code, result.error.message);
+      // Forward code+message as before, plus the cause, the responsible source,
+      // the redacted detail, the fix, and the per-source roster.
+      return errorResponse(result.error.code, result.error.message, failureFields(result.error, this.callerCeiling));
     }
 
     const quorum = result.value;
@@ -66,6 +80,7 @@ export class PeerReviewController {
         requiredWeight: quorum.requiredWeight,
         agreeingWeight: quorum.agreeingWeight,
         ...(quorum.arbiterFailed === true ? { arbiterFailed: true } : {}),
+        ...(quorum.arbiter !== undefined ? { arbiter: quorum.arbiter } : {}),
         sources: quorum.sources,
       },
       tokenUsage: {

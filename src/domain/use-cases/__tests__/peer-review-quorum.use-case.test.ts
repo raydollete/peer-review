@@ -1,6 +1,11 @@
 import { ok, err, type Result } from 'neverthrow';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
-import { ValidationError } from '../../errors/index.js';
+import {
+  CredentialError,
+  QuorumFailureError,
+  TransportError,
+  ValidationError,
+} from '../../errors/index.js';
 import { ExternalServiceError, TimeoutError, type DomainError } from '../../../shared/errors/index.js';
 import type { PeerResponse } from '../../entities/index.js';
 import {
@@ -251,6 +256,10 @@ describe('PeerReviewQuorumUseCase', () => {
     const report = result.sources.find((s) => s.name === 'straggler');
     expect(report?.status).toBe('error');
     expect(report?.error).toBe('No response recorded before the run ended');
+    // Not only prose: the straggler names the clock that killed it (task 15).
+    expect(report?.cause).toBe('deadline');
+    expect(report?.timeoutMs).toBe(60);
+    expect(straggler.calls[0]?.signal?.aborted).toBe(true);
     expect(warnings).not.toContain('Peer failed during quorum');
   });
 
@@ -969,5 +978,188 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(arbiter.calls).toHaveLength(2); // first bounded+aborted, second healthy
     expect(result.achieved).toBe(true);
     expect(result.tier).toBe(2);
+  });
+});
+
+describe('PeerReviewQuorumUseCase: failure contract (tasks 3, 4, 15)', () => {
+  const prompt = 'Which transport is best for 500 km cargo, and why?';
+
+  it('records the arbiter cause when the arbiter answers in prose (task 3)', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter: makeArbiter(['garbage']),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    expect(result.arbiterFailed).toBe(true);
+    expect(result.arbiter).toEqual({
+      name: 'arbiter',
+      status: 'failed',
+      error: {
+        code: 'EXTERNAL_SERVICE_ERROR',
+        cause: 'arbiter_malformed',
+        detail: 'arbiter "arbiter" reply failed JSON extraction after one re-ask',
+      },
+    });
+  });
+
+  it('records an unavailable arbiter when the arbiter call itself fails (task 3)', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter: makeArbiter(['transport-error']),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    expect(result.arbiterFailed).toBe(true);
+    expect(result.arbiter?.error.cause).toBe('arbiter_unavailable');
+    expect(result.arbiter?.name).toBe('arbiter');
+  });
+
+  it('keeps the arbiter failure in the failure envelope when no peer got through (task 4)', async () => {
+    const down = makeSource(
+      'down',
+      1,
+      2,
+      async () => err(new TransportError('Network error: TypeError: fetch failed', 'down', 'ECONNREFUSED')),
+    );
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [down],
+      arbiter: makeArbiter(['transport-error']),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const failure = (await useCase.execute({ prompt }))._unsafeUnwrapErr();
+    expect(failure).toBeInstanceOf(QuorumFailureError);
+    const error = failure as QuorumFailureError;
+    expect(error.message).toBe('No peer source produced a response');
+    // The arbiter is only consulted once something succeeded — no invented row.
+    expect(error.context?.arbiter).toBeUndefined();
+    expect(error.context?.sources).toHaveLength(1);
+    expect(error.context?.sources[0]?.cause).toBe('peer_unreachable');
+  });
+
+  it('names the three total-outage shapes apart with distinct causes (task 4)', async () => {
+    const refused = makeSource(
+      'refused',
+      1,
+      2,
+      async () => err(new TransportError('Network error: TypeError: fetch failed', 'refused', 'ECONNREFUSED')),
+    );
+    const outage = (await new PeerReviewQuorumUseCase({
+      sources: [refused],
+      arbiter: makeArbiter([{ refused: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    }).execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+
+    const noKey = makeSource('no-key', 1, 2, answers('no-key', 'x'), false);
+    const credential = (await new PeerReviewQuorumUseCase({
+      sources: [noKey],
+      arbiter: makeArbiter([{ 'no-key': 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    }).execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+
+    const me = makeSource('me', 1, 2, answers('me', 'x'));
+    const skipped = (await new PeerReviewQuorumUseCase({
+      sources: [me],
+      arbiter: makeArbiter([{ me: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    }).execute({ prompt, callerSource: 'me' }))._unsafeUnwrapErr() as QuorumFailureError;
+
+    expect(outage.cause).toBe('peer_unreachable');
+    expect(outage.source).toBe('refused');
+    expect(credential.cause).toBe('credential');
+    expect(skipped.cause).toBe('configuration');
+    // A configuration fault never reads as a network fault.
+    expect(new Set([outage.cause, credential.cause, skipped.cause]).size).toBe(3);
+    for (const failure of [outage, credential, skipped]) {
+      expect(failure.context).toBeDefined();
+      expect(failure.context?.sources.length).toBeGreaterThan(0);
+      expect(typeof failure.fix).toBe('string');
+      expect(typeof failure.detail).toBe('string');
+    }
+  });
+
+  it('names 401 and refused-connection fleets apart, not both as generic outage (task 4)', async () => {
+    const denied = makeSource('denied', 1, 2, async () => err(new CredentialError('Authentication failed for "denied" (HTTP 401)')));
+    const refused = makeSource(
+      'refused',
+      1,
+      2,
+      async () => err(new TransportError('Network error: TypeError: fetch failed', 'refused', 'ECONNREFUSED')),
+    );
+    const deniedRun = (await new PeerReviewQuorumUseCase({
+      sources: [denied],
+      arbiter: makeArbiter([{ denied: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    }).execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+    const refusedRun = (await new PeerReviewQuorumUseCase({
+      sources: [refused],
+      arbiter: makeArbiter([{ refused: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    }).execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+    expect(deniedRun.cause).toBe('credential');
+    expect(refusedRun.cause).toBe('peer_unreachable');
+  });
+
+  it('reports a failed source with its own typed cause, not only prose (task 15)', async () => {
+    const timedOut = makeSource('slow', 1, 2, async () => err(new TimeoutError('Request to "slow" was aborted', 250)));
+    const denied = makeSource('denied', 1, 2, async () => err(new CredentialError('Authentication failed for "denied" (HTTP 401)')));
+    const healthy = makeSource('healthy', 1, 2, answers('healthy', 'train'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [healthy, timedOut, denied],
+      arbiter: makeArbiter([{ healthy: 0.9, slow: 0.9, denied: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    const slow = result.sources.find((s) => s.name === 'slow');
+    expect(slow?.cause).toBe('deadline');
+    expect(slow?.timeoutMs).toBe(250);
+    expect(slow?.error).toContain('aborted');
+    const deniedReport = result.sources.find((s) => s.name === 'denied');
+    expect(deniedReport?.cause).toBe('credential');
+    expect(deniedReport?.code).toBe('CONFIGURATION_ERROR');
+  });
+
+  it('gives the top-level cause to the highest-weight failed source (design invariant)', async () => {
+    const light = makeSource('light', 1, 1, async () => err(new TransportError('Network error: fetch failed', 'light', 'ECONNREFUSED')));
+    const heavy = makeSource('heavy', 1, 3, async () => err(new CredentialError('Authentication failed for "heavy" (HTTP 401)')));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [light, heavy],
+      arbiter: makeArbiter([{ light: 0.9, heavy: 0.9 }]),
+      thresholds: { 1: 5 },
+      deadlineMs: 5000,
+    });
+    const failure = (await useCase.execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+    expect(failure.cause).toBe('credential');
+    expect(failure.source).toBe('heavy');
+    // The roster keeps each source's own cause beside the top-level one.
+    expect(failure.context?.sources.find((s) => s.name === 'light')?.cause).toBe('peer_unreachable');
+  });
+
+  it('gives a never-settled straggler the run deadline cause with its budget (task 15)', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const never = makeSource('b', 1, 2, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, never],
+      arbiter: makeArbiter([{ a: 0.9 }]),
+      thresholds: { 1: 5 },
+      deadlineMs: 60,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    const report = result.sources.find((s) => s.name === 'b');
+    expect(report?.status).toBe('error');
+    expect(report?.cause).toBe('deadline');
+    expect(report?.timeoutMs).toBe(60);
+    expect(a.calls[0]?.signal?.aborted).toBe(true);
   });
 });

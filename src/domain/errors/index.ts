@@ -1,4 +1,15 @@
-export { PeerApiError, PeerRateLimitError } from './peer-errors.js';
+export {
+  PeerApiError,
+  PeerRateLimitError,
+  CredentialError,
+  TransportError,
+  CancellationError,
+  TierBudgetElapsedError,
+  MalformedResponseBodyError,
+  ArbiterMalformedError,
+  QuorumFailureError,
+} from './peer-errors.js';
+export { causeOf, fixFor, type PeerReviewFailureCause } from './failure-cause.js';
 export {
   DomainError,
   ValidationError,

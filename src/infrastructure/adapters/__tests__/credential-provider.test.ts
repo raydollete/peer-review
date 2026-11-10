@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { CredentialProvider } from '../credential-provider.js';
 import { ConfigurationError } from '../../../shared/errors/index.js';
+import { CredentialError, causeOf } from '../../../domain/errors/index.js';
 
 describe('CredentialProvider', () => {
   describe('apiKeyEnv path', () => {
@@ -98,5 +99,32 @@ describe('CredentialProvider', () => {
       const result = await provider.getCredential();
       expect(result._unsafeUnwrapErr()).toBeInstanceOf(ConfigurationError);
     });
+  });
+});
+
+describe('CredentialProvider: leak sinks (task 16)', () => {
+  it('names the source and failure class, never the command line, on a non-zero exit', async () => {
+    // Node's execFile rejection embeds the full command line — which carries the
+    // credential material itself. Neither may reach the caller-visible fields.
+    const run = jest
+      .fn()
+      .mockRejectedValue(new Error('Command failed: /bin/sh -c mint --token sk-LEAKEDcmd42 exit 1'));
+    const provider = new CredentialProvider(
+      { name: 'vaulty', apiKeyCommand: 'mint --token sk-LEAKEDcmd42' },
+      { runCommand: run },
+    );
+    const error = (await provider.getCredential())._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ConfigurationError);
+    expect(error).toBeInstanceOf(CredentialError);
+    expect(error.message).toContain('vaulty');
+    expect(error.message).toContain('non-zero exit');
+    expect(JSON.stringify(error)).not.toContain('sk-LEAKEDcmd42');
+    expect(JSON.stringify(error)).not.toContain('mint --token');
+  });
+
+  it('classifies credential faults for the cause mapper', async () => {
+    const provider = new CredentialProvider({ name: 'unset' }, { runCommand: jest.fn() });
+    const error = (await provider.getCredential())._unsafeUnwrapErr();
+    expect(causeOf(error)).toBe('credential');
   });
 });

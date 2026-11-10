@@ -1,10 +1,10 @@
 import { err, type Result } from 'neverthrow';
-import type { HistoryTurn, PeerResponse, QuorumResult } from '../entities/index.js';
+import type { HistoryTurn, PeerResponse, QuorumResult, ArbiterErrorRecord } from '../entities/index.js';
 import type { PeerSource } from '../ports/index.js';
 import { ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
 import type { DomainError } from '../errors/index.js';
 import type { AgreementEvaluation } from './agreement.js';
-import { markFailed, markOk, markSkipped, markTierSkippedForTime, seedReport } from './source-reports.js';
+import { attachCallerAbort, markDeadlineStragglers, markFailed, markOk, markSkipped, markTierSkippedForTime, noteUnknownCallerSource, seedReport } from './source-reports.js';
 import type { MutableReport } from './source-reports.js';
 import {
   computeTierBudget,
@@ -54,6 +54,12 @@ export interface RunState {
   agreeingWeight: number;
   achieved: boolean;
   arbiterFailed: boolean;
+  /** Preserved arbiter failure (typed cause + redacted detail); set where
+   * arbiterFailed is set, cleared where it is cleared. */
+  arbiterError?: ArbiterErrorRecord | undefined;
+  /** Names of sources that settled with any outcome — a never-settled report is
+   * the run's own straggler, not a peer that failed. */
+  settled: Set<string>;
   evaluatedCount: number;
   deadlineHit: boolean;
   /** Highest tier launched so far — read at the wall too, before the run returns. */
@@ -67,7 +73,7 @@ interface Settled {
 export class PeerReviewQuorumUseCase {
   constructor(private readonly deps: QuorumDeps) {}
 
-  async execute(input: QuorumInput): Promise<Result<QuorumResult, DomainError>> {
+  async execute(input: QuorumInput, callerSignal?: AbortSignal): Promise<Result<QuorumResult, DomainError>> {
     const tiers = [...new Set(this.deps.sources.map((s) => s.tier))].sort((a, b) => a - b);
     const maxTier = tiers[tiers.length - 1];
     if (maxTier === undefined) {
@@ -79,16 +85,7 @@ export class PeerReviewQuorumUseCase {
       return err(new ValidationError(`No threshold configured for tier ${targetTier}`));
     }
 
-    // A3: an unknown callerSource is a logged no-op, never a crash — the caller
-    // may be pointed at a differently-configured server than it assumes.
-    if (
-      input.callerSource !== undefined &&
-      !this.deps.sources.some((s) => s.name === input.callerSource)
-    ) {
-      this.deps.logger?.warn('callerSource names no configured source; ignoring', {
-        callerSource: input.callerSource,
-      });
-    }
+    noteUnknownCallerSource(input, this.deps.sources, this.deps.logger);
 
     const state: RunState = {
       reports: new Map(),
@@ -98,11 +95,13 @@ export class PeerReviewQuorumUseCase {
       agreeingWeight: 0,
       achieved: false,
       arbiterFailed: false,
+      settled: new Set<string>(),
       evaluatedCount: 0,
       deadlineHit: false,
       reachedTier: targetTier,
     };
     const controller = new AbortController();
+    const detachCallerAbort = attachCallerAbort(controller, callerSignal);
     const start = Date.now();
     const timer = setTimeout(() => {
       state.deadlineHit = true;
@@ -120,9 +119,11 @@ export class PeerReviewQuorumUseCase {
       ]);
     } finally {
       clearTimeout(timer);
+      detachCallerAbort();
       controller.abort();
     }
-    return assembleResult(input, state, state.reachedTier, requiredWeight);
+    markDeadlineStragglers(state, this.deps.deadlineMs);
+    return assembleResult(input, state, state.reachedTier, requiredWeight, this.deps.sources);
   }
 
   /**
@@ -363,6 +364,7 @@ export class PeerReviewQuorumUseCase {
     if (report === undefined) {
       return;
     }
+    state.settled.add(settled.source.name);
     if (settled.result.isOk()) {
       markOk(report);
       state.successes.push({ source: settled.source, response: settled.result.value });

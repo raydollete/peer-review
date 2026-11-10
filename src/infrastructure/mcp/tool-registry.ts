@@ -1,7 +1,7 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 export interface ToolHandler {
-  (args: unknown): Promise<unknown>;
+  (args: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 
 export interface ToolDefinition {

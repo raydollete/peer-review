@@ -257,3 +257,41 @@ describe('timeout-vs-deadline startup guard', () => {
     ).not.toThrow();
   });
 });
+
+describe('declared caller ceiling (task 8)', () => {
+  it('defaults the ceiling to 300000', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    expect(loadEnvConfig({}).callerTimeoutMs).toBe(300000);
+  });
+
+  it('is healthy — and silent — when the deadline sits strictly below it', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    const { callerCeilingMismatch } = await import('../validate-timeouts.js');
+    expect(callerCeilingMismatch(loadEnvConfig({}))).toBeUndefined();
+  });
+
+  it('names both numbers and the two fixes when the deadline outlives the ceiling', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    const { callerCeilingMismatch } = await import('../validate-timeouts.js');
+    // deadline 280000, ceiling 30000: boots (returns, no throw), warns, and is
+    // surfaced by list_peers (asserted in controllers.test).
+    const mismatch = callerCeilingMismatch(
+      loadEnvConfig({ PEER_REVIEW_CALLER_TIMEOUT_MS: '30000' }),
+    );
+    expect(mismatch).toBeDefined();
+    expect(mismatch?.deadlineMs).toBe(280000);
+    expect(mismatch?.callerTimeoutMs).toBe(30000);
+    expect(mismatch?.cause).toBe('configuration');
+    expect(mismatch?.fix).toContain('280000');
+    expect(mismatch?.fix).toContain('30000');
+    expect(mismatch?.fix).toContain('lower the deadline');
+    expect(mismatch?.fix).toContain('harness registration');
+  });
+
+  it('treats an equal pair as a mismatch (strictly below required)', async () => {
+    const { loadEnvConfig } = await import('../env.config.js');
+    const { callerCeilingMismatch } = await import('../validate-timeouts.js');
+    const env = loadEnvConfig({ PEER_REVIEW_CALLER_TIMEOUT_MS: '280000' });
+    expect(callerCeilingMismatch(env)).toBeDefined();
+  });
+});

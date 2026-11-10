@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ok, err, type Result } from 'neverthrow';
-import { ConfigurationError, type DomainError } from '../../shared/errors/index.js';
+import { CredentialError, type DomainError } from '../../domain/errors/index.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -63,7 +63,7 @@ export class CredentialProvider implements ICredentialProvider {
     if (this.source.apiKeyCommand !== undefined) {
       return this.fromCommand(this.source.apiKeyCommand);
     }
-    return err(new ConfigurationError(`Source "${this.source.name}" has no credential configured`));
+    return err(new CredentialError(`Source "${this.source.name}" has no credential configured`));
   }
 
   invalidate(): void {
@@ -74,7 +74,7 @@ export class CredentialProvider implements ICredentialProvider {
     const value = this.env[varName];
     if (value === undefined || value.length === 0) {
       return err(
-        new ConfigurationError(
+        new CredentialError(
           `Environment variable "${varName}" for source "${this.source.name}" is not set`,
         ),
       );
@@ -91,9 +91,11 @@ export class CredentialProvider implements ICredentialProvider {
     try {
       ({ stdout } = await this.runCommand(command));
     } catch {
-      // Never propagate command output/error detail: it can carry credential material.
+      // Never propagate Node's execFile message (it embeds the whole command
+      // line) or any command output: the detail is a fixed line naming the
+      // source and the failure class only — it can carry credential material.
       return err(
-        new ConfigurationError(
+        new CredentialError(
           `Credential command for source "${this.source.name}" failed (non-zero exit)`,
         ),
       );
@@ -102,7 +104,7 @@ export class CredentialProvider implements ICredentialProvider {
     const value = stdout.trim();
     if (value.length === 0) {
       return err(
-        new ConfigurationError(
+        new CredentialError(
           `Credential command for source "${this.source.name}" produced empty output`,
         ),
       );

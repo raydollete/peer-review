@@ -2,7 +2,7 @@ import { ok, err, type Result } from 'neverthrow';
 import { z } from 'zod';
 import type { PeerResponse, TokenUsage } from '../entities/index.js';
 import type { IPeerClient } from '../ports/index.js';
-import { ExternalServiceError, type DomainError } from '../errors/index.js';
+import { ArbiterMalformedError, type DomainError } from '../errors/index.js';
 import type { ILogger } from '../../shared/logger/index.js';
 import { sanitizeModelText, stripCodeFences } from '../../shared/text/index.js';
 import {
@@ -174,9 +174,8 @@ export async function evaluateAgreement(
     });
   }
 
-  return err(
-    new ExternalServiceError('Arbiter returned malformed JSON after one re-ask', params.arbiter.name),
-  );
+  const detail = 'Arbiter returned malformed JSON after one re-ask';
+  return err(new ArbiterMalformedError(detail, params.arbiter.name));
 }
 
 /** `min(1, agreeingWeight / requiredWeight) × mean agreement of agreeing sources`, in [0, 1]. */

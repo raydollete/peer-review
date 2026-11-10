@@ -1,6 +1,7 @@
 import { ConfigurationError } from '../shared/errors/index.js';
 import type { EnvConfig } from './env.config.js';
 import type { PeerReviewConfig } from './peer-config.js';
+import type { CallerCeiling } from '../domain/use-cases/list-peers.use-case.js';
 
 /**
  * Startup guard: the first tier wave plus its arbiter evaluation MUST be
@@ -38,4 +39,30 @@ export function validateTimeoutsAgainstDeadline(config: PeerReviewConfig, env: E
         `while keeping it below the MCP client's tool-call timeout.`,
     );
   }
+}
+
+/**
+ * The caller-ceiling pair: `PEER_REVIEW_DEADLINE_MS` MUST sit strictly below
+ * the declared `PEER_REVIEW_CALLER_TIMEOUT_MS` (the MCP client's tool-call
+ * timeout). Above it, the caller abandons the call at its own ceiling and
+ * reports only its generic timeout — no verdict anyone computed is read.
+ * The harness registration owner sets the client timeout; this server only
+ * declares the value it assumes. A mismatch WARNs and keeps serving — a
+ * slow-but-working server must not become a dead server whose only message is
+ * one line on an unpersisted stderr — and is surfaced on `list_peers` and
+ * every failure envelope while it holds.
+ */
+export function callerCeilingMismatch(env: EnvConfig): CallerCeiling | undefined {
+  if (env.deadlineMs < env.callerTimeoutMs) {
+    return undefined;
+  }
+  return {
+    deadlineMs: env.deadlineMs,
+    callerTimeoutMs: env.callerTimeoutMs,
+    cause: 'configuration',
+    fix:
+      `PEER_REVIEW_DEADLINE_MS (${env.deadlineMs}ms) is not below ` +
+      `PEER_REVIEW_CALLER_TIMEOUT_MS (${env.callerTimeoutMs}ms): lower the deadline, ` +
+      `or raise the tool-call timeout in the harness registration`,
+  };
 }

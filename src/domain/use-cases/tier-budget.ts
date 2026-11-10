@@ -1,5 +1,5 @@
 import type { PeerSource } from '../ports/index.js';
-import { ExternalServiceError } from '../errors/index.js';
+import { TierBudgetElapsedError } from '../errors/index.js';
 import { markCancelled, markFailed, type MutableReport } from './source-reports.js';
 
 /** Floor for a tier's time budget: the escalation timebox must never go
@@ -49,7 +49,7 @@ export function markPendingOutage(
     if (report !== undefined && report.status === 'error') {
       markFailed(
         report,
-        new ExternalServiceError('tier budget elapsed — still in flight', source.name),
+        new TierBudgetElapsedError('tier budget elapsed — still in flight', source.name),
       );
     }
   }

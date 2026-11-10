@@ -1,1 +1,6 @@
-export { successResponse, errorResponse, type McpToolResponse } from './mcp-response.js';
+export {
+  successResponse,
+  errorResponse,
+  type McpToolResponse,
+  type McpToolErrorFields,
+} from './mcp-response.js';

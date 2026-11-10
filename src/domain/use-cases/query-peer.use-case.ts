@@ -14,17 +14,31 @@ export class QueryPeerUseCase {
     private readonly sources: readonly PeerSource[],
     /** The global deadline: a source's own timeoutMs may exceed it. */
     private readonly deadlineMs: number,
+    /** Declared MCP client tool-call ceiling: the single call is bounded by the
+     * smaller of the two so an answer arrives before the caller abandons. */
+    private readonly callerTimeoutMs?: number,
   ) {}
 
-  async execute(input: QueryPeerInput): Promise<Result<PeerResponse, DomainError>> {
+  async execute(
+    input: QueryPeerInput,
+    callerSignal?: AbortSignal,
+  ): Promise<Result<PeerResponse, DomainError>> {
     const source = resolveSource(this.sources, input.source);
     if (source.isErr()) {
       return err(source.error);
     }
+    const boundMs =
+      this.callerTimeoutMs === undefined
+        ? this.deadlineMs
+        : Math.min(this.deadlineMs, this.callerTimeoutMs);
+    const signals = [AbortSignal.timeout(boundMs)];
+    if (callerSignal !== undefined) {
+      signals.push(callerSignal);
+    }
     return source.value.client.complete({
       prompt: input.prompt,
       history: input.history,
-      signal: AbortSignal.timeout(this.deadlineMs),
+      signal: AbortSignal.any(signals),
     });
   }
 }
