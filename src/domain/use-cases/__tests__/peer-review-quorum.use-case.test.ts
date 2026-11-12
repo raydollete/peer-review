@@ -1,13 +1,16 @@
 import { ok, err, type Result } from 'neverthrow';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
 import {
+  CancellationError,
   CredentialError,
+  PeerRateLimitError,
   QuorumFailureError,
   TransportError,
   ValidationError,
 } from '../../errors/index.js';
 import { ExternalServiceError, TimeoutError, type DomainError } from '../../../shared/errors/index.js';
-import type { PeerResponse } from '../../entities/index.js';
+import type { PeerResponse, QuorumSourceReport } from '../../entities/index.js';
+import type { PeerSource } from '../../ports/index.js';
 import {
   makeSource,
   makeArbiter,
@@ -15,7 +18,17 @@ import {
   peerResponse,
   resolvesOnAbortOnly,
   resolvesAfterDelay,
+  slowArbiter,
 } from './helpers.js';
+import {
+  initialAbortAttribution,
+  markCancelledStragglers,
+  recordSettled,
+  seedReport,
+  type AbortOriginFlags,
+  type RecordState,
+} from '../source-reports.js';
+import { markPendingCancelled, markPendingOutage } from '../tier-budget.js';
 
 describe('PeerReviewQuorumUseCase', () => {
   it('reports a no-usable-text peer as error and reaches quorum on remaining weight', async () => {
@@ -78,7 +91,12 @@ describe('PeerReviewQuorumUseCase', () => {
 
     const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
 
-    expect(result.sources.find((s) => s.name === 'slow')?.error).toBeDefined();
+    const slowReport = result.sources.find((s) => s.name === 'slow');
+    // The run no longer needed its vote: the explanation is a non-failure note,
+    // not the failure slot.
+    expect(slowReport?.status).toBe('cancelled');
+    expect(slowReport?.note).toBe('Cancelled: quorum was met before this source responded');
+    expect(slowReport?.error).toBeUndefined();
   });
 
   it('tier-1 quorum stops escalation — no tier-2 source is called', async () => {
@@ -196,23 +214,13 @@ describe('PeerReviewQuorumUseCase', () => {
     const slowReport = result.sources.find((s) => s.name === 'slow');
     expect(slowReport?.status).toBe('cancelled');
     expect(slowReport?.agreement).toBeNull();
-    expect(slowReport?.error).toBe('Cancelled: quorum was met before this source responded');
+    expect(slowReport?.weight).toBe(0); // configured 1: a cancelled peer contributed no vote
+    expect(slowReport?.note).toBe('Cancelled: quorum was met before this source responded');
+    expect(slowReport?.error).toBeUndefined();
+    expect(slowReport?.cause).toBeUndefined();
   });
 
   // ── stragglers while the arbiter is evaluating ─────────────────────────────
-
-  /** Arbiter that answers `ratings` after `ms`, ignoring abort — a slow evaluation
-   * that the peer signal (deadline or tier budget) can fire during. */
-  function slowArbiter(ms: number, ratings: Record<string, number>) {
-    return makeSource('arbiter', 99, 1, () =>
-      new Promise((resolve) => {
-        setTimeout(() => {
-          const body = Object.entries(ratings).map(([name, agreement]) => ({ name, agreement }));
-          resolve(ok(peerResponse('arbiter', JSON.stringify({ consensus: 'CONSENSUS', ratings: body }))));
-        }, ms);
-      }),
-    );
-  }
 
   it('records a peer that settles during an achieving evaluation instead of cancelling it', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'yes'));
@@ -248,7 +256,7 @@ describe('PeerReviewQuorumUseCase', () => {
       deadlineMs: 60,
       tierTimeoutMs: { 1: 30 },
       arbiterTimeoutMs: 20,
-      logger: { warn: (msg: string) => { warnings.push(msg); } },
+      logger: { warn: (msg: string) => { warnings.push(msg); }, debug: () => undefined },
     });
 
     const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
@@ -643,6 +651,7 @@ describe('PeerReviewQuorumUseCase', () => {
           warnings += 1;
           lastMeta = meta;
         },
+        debug: () => undefined,
       },
     });
 
@@ -1161,5 +1170,431 @@ describe('PeerReviewQuorumUseCase: failure contract (tasks 3, 4, 15)', () => {
     expect(report?.cause).toBe('deadline');
     expect(report?.timeoutMs).toBe(60);
     expect(a.calls[0]?.signal?.aborted).toBe(true);
+  });
+});
+
+// ── abort attribution: a clock that expired fails a peer; an abort the run
+// caused cancels it (report-cancelled-peers-as-non-failures) ─────────────────
+
+describe('PeerReviewQuorumUseCase: abort attribution', () => {
+  const prompt = 'Capital of France?';
+  const QUORUM_MET_NOTE = 'Cancelled: quorum was met before this source responded';
+  const CALLER_NOTE = 'Cancelled: the caller cancelled the call before this source responded';
+
+  /** The error the HTTP adapter produces for an orchestrator abort. */
+  const cancelError = (name: string): DomainError =>
+    new CancellationError(`Request to "${name}" was cancelled by the orchestrator`, name);
+
+  /** The field combination a roster row may carry; anything else the row grows
+   * (a stray failure slot on a non-failure row) fails the comparison. */
+  function rosterRow(
+    row:
+      | Pick<QuorumSourceReport, 'status' | 'weight' | 'agreement' | 'error' | 'cause' | 'note' | 'timeoutMs'>
+      | undefined,
+  ) {
+    return {
+      status: row?.status,
+      weight: row?.weight,
+      agreement: row?.agreement,
+      error: row?.error,
+      cause: row?.cause,
+      note: row?.note,
+      timeoutMs: row?.timeoutMs,
+    };
+  }
+
+  function collectors() {
+    const warnings: string[] = [];
+    const debugs: string[] = [];
+    return {
+      warnings,
+      debugs,
+      logger: {
+        warn: (message: string) => {
+          warnings.push(message);
+        },
+        debug: (message: string) => {
+          debugs.push(message);
+        },
+      },
+    };
+  }
+
+  const byName = (sources: readonly QuorumSourceReport[], name: string) =>
+    sources.find((s) => s.name === name);
+
+  /** Fold one settled `Err` into a fresh single-row run under the given origin
+   * flags — the attribution decision with the race taken out of it. */
+  function recordCase(
+    flags: Partial<AbortOriginFlags>,
+    name: string,
+    error: DomainError,
+    logger: { warn: (m: string) => void; debug: (m: string) => void },
+  ) {
+    const source = makeSource(name, 1, 2, answers(name, 'x'));
+    const report = seedReport(source);
+    const state: RecordState = {
+      ...initialAbortAttribution(),
+      ...flags,
+      reports: new Map([[source.name, report]]),
+      settled: new Set<string>(),
+      successes: [],
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    };
+    recordSettled(state, { source, result: err(error) }, logger);
+    return report;
+  }
+
+  it('reports in-flight peers as cancelled, not tier-budget outages, when the caller cancels mid-run', async () => {
+    const caller = new AbortController();
+    // The caller walks away from inside the wave, so the run unwinds on its abort
+    // while both peers are still in flight — whichever of the two the orchestrator
+    // manages to observe, the row must read the same way.
+    const leaves = makeSource('leaves', 1, 2, (request) => {
+      const { promise, resolve } = Promise.withResolvers<Result<PeerResponse, DomainError>>();
+      request.signal?.addEventListener(
+        'abort',
+        () => resolve(err(cancelError('leaves'))),
+        { once: true },
+      );
+      caller.abort();
+      return promise;
+    });
+    const straggler = makeSource('straggler', 1, 2, resolvesOnAbortOnly);
+    const { warnings, logger } = collectors();
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [leaves, straggler],
+      arbiter: makeArbiter([{ leaves: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+      logger,
+    });
+
+    const failure = (await useCase.execute({ prompt }, caller.signal))._unsafeUnwrapErr() as QuorumFailureError;
+
+    // F2: before this change the caller's own abort either stamped every in-flight
+    // peer with TierBudgetElapsedError (cause 'deadline') or left the seeded
+    // "no response recorded" error on it — a fleet-wide outage nobody caused.
+    const rows = failure.context?.sources ?? [];
+    expect(rows.map((r) => r.name).sort()).toEqual(['leaves', 'straggler']);
+    for (const name of ['leaves', 'straggler']) {
+      expect(rosterRow(byName(rows, name))).toEqual({
+        status: 'cancelled',
+        weight: 0, // configured 2
+        agreement: null,
+        error: undefined,
+        cause: undefined,
+        note: CALLER_NOTE,
+        timeoutMs: undefined,
+      });
+    }
+    expect(JSON.stringify(rows)).not.toContain('tier budget');
+    expect(warnings).not.toContain('Peer failed during quorum');
+    // F4: with nothing but cancelled rows the envelope names the run, not 'internal'.
+    expect(failure.cause).toBe('cancelled');
+    expect(failure.fix).toContain('wider tier');
+  });
+
+  it('gives the peer that settled on the abort the same row as the one that never settled', () => {
+    const settledSource = makeSource('settled-abort', 1, 2, resolvesOnAbortOnly);
+    const missingSource = makeSource('never', 1, 2, resolvesOnAbortOnly);
+    const state: RecordState = {
+      ...initialAbortAttribution(),
+      runAborted: true,
+      reports: new Map([
+        [settledSource.name, seedReport(settledSource)],
+        [missingSource.name, seedReport(missingSource)],
+      ]),
+      settled: new Set<string>(),
+      successes: [],
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    };
+    const { warnings, debugs, logger } = collectors();
+
+    // The orchestrator observes one abort settle; the sibling is still in flight
+    // when the run unwinds, so the straggler pass itemizes it instead.
+    recordSettled(state, { source: settledSource, result: err(cancelError('settled-abort')) }, logger);
+    markCancelledStragglers(state);
+
+    const settled = rosterRow(state.reports.get('settled-abort'));
+    const missing = rosterRow(state.reports.get('never'));
+    expect(settled).toEqual(missing);
+    expect(settled).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: QUORUM_MET_NOTE,
+      timeoutMs: undefined,
+    });
+    // Not a peer failure, so the alertable warn stays clean and the record is debug.
+    expect(warnings).not.toContain('Peer failed during quorum');
+    expect(debugs).toContain('Peer cancelled during quorum');
+  });
+
+  it('keeps the wall in charge when it expires during the achieving evaluation', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const straggler = makeSource('straggler', 1, 2, resolvesOnAbortOnly);
+    const { warnings, logger } = collectors();
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, straggler],
+      arbiter: slowArbiter(250, { a: 0.9 }), // achieves, but answers after the wall
+      thresholds: { 1: 2 },
+      // Peer clock ≈ 170ms, wall 200ms, arbiter 250ms: the abort that ends the run
+      // is the wall's, so the straggler keeps the failure shape the wall assigns
+      // it (F3) rather than the cancelled row the early-abort would write.
+      deadlineMs: 200,
+      tierTimeoutMs: { 1: 5000 },
+      arbiterTimeoutMs: 30,
+      logger,
+    });
+
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+
+    expect(rosterRow(byName(result.sources, 'straggler'))).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'No response recorded before the run ended',
+      cause: 'deadline',
+      note: undefined,
+      timeoutMs: 200,
+    });
+    expect(warnings).not.toContain('Peer failed during quorum');
+  });
+
+  it('keeps a 401/429 that settles inside the abort window a peer failure with its own cause', () => {
+    const { warnings, debugs, logger } = collectors();
+
+    // F1: the abort window is not a licence to strip a peer-side failure of its
+    // cause — only the abort-shaped error is a non-failure.
+    const denied = recordCase(
+      { runAborted: true, callerCancelled: true },
+      'denied',
+      new CredentialError('Authentication failed for "denied" (HTTP 401)'),
+      logger,
+    );
+    expect(rosterRow(denied)).toEqual({
+      status: 'unavailable',
+      weight: 2,
+      agreement: null,
+      error: 'Authentication failed for "denied" (HTTP 401)',
+      cause: 'credential',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+
+    const limited = recordCase(
+      { runAborted: true, callerCancelled: true },
+      'limited',
+      new PeerRateLimitError(1000),
+      logger,
+    );
+    expect(rosterRow(limited)).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'Rate limit exceeded. Retry after 1000ms',
+      cause: 'rate_limited',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+
+    const left = recordCase(
+      { runAborted: true, callerCancelled: true },
+      'left',
+      cancelError('left'),
+      logger,
+    );
+    expect(rosterRow(left)).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: CALLER_NOTE,
+      timeoutMs: undefined,
+    });
+    expect(warnings.filter((m) => m === 'Peer failed during quorum')).toHaveLength(2);
+    expect(debugs).toEqual(['Peer cancelled during quorum']);
+  });
+
+  it('fails a peer whose clock expired while the same abort shape cancels its sibling', () => {
+    const { warnings, debugs, logger } = collectors();
+
+    const byRun = recordCase({ runAborted: true }, 'run-abort', cancelError('run-abort'), logger);
+    expect(rosterRow(byRun)).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: QUORUM_MET_NOTE,
+      timeoutMs: undefined,
+    });
+
+    // The peer's own tier budget, and the global wall: each clock that expired is
+    // the peer's failure, even though the request died on the same abort error.
+    for (const flags of [
+      { runAborted: true, tierClockFired: true },
+      { runAborted: true, deadlineHit: true },
+    ]) {
+      const byClock = recordCase(flags, 'clock', cancelError('clock'), logger);
+      expect(rosterRow(byClock)).toEqual({
+        status: 'error',
+        weight: 2,
+        agreement: null,
+        error: 'Request to "clock" was cancelled by the orchestrator',
+        cause: 'deadline',
+        note: undefined,
+        timeoutMs: undefined,
+      });
+    }
+    expect(warnings.filter((m) => m === 'Peer failed during quorum')).toHaveLength(2);
+    expect(debugs).toEqual(['Peer cancelled during quorum']);
+  });
+
+  it('cancels the in-flight peers the run walked away from and only fails those the tier clock ran out on', () => {
+    const slow = makeSource('slow', 1, 2, resolvesOnAbortOnly);
+    const inflight = new Map<number, PeerSource>([[0, slow]]);
+
+    // F2 at the mark site: the caller left, the tier's own budget never expired.
+    const left = new Map([[slow.name, seedReport(slow)]]);
+    markPendingOutage(inflight, left, {
+      ...initialAbortAttribution(),
+      runAborted: true,
+      callerCancelled: true,
+    });
+    expect(rosterRow(left.get(slow.name))).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: CALLER_NOTE,
+      timeoutMs: undefined,
+    });
+
+    // The tier's budget expired: the same peer stays outage-shaped.
+    const outage = new Map([[slow.name, seedReport(slow)]]);
+    markPendingOutage(inflight, outage, {
+      ...initialAbortAttribution(),
+      runAborted: true,
+      tierClockFired: true,
+    });
+    expect(rosterRow(outage.get(slow.name))).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'tier budget elapsed — still in flight',
+      cause: 'deadline',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+  });
+
+  it('never cancels at the early-abort site what the wall already killed', () => {
+    const left = makeSource('left', 1, 2, resolvesOnAbortOnly);
+    const inflight = new Map<number, PeerSource>([[0, left]]);
+
+    const afterQuorum = new Map([[left.name, seedReport(left)]]);
+    markPendingCancelled(inflight, afterQuorum, initialAbortAttribution());
+    expect(rosterRow(afterQuorum.get(left.name))).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: QUORUM_MET_NOTE,
+      timeoutMs: undefined,
+    });
+
+    // F3: the wall expired during that same evaluation — the straggler keeps the
+    // error shape, so the deadline stays visible to the caller.
+    const duringWall = new Map([[left.name, seedReport(left)]]);
+    markPendingCancelled(inflight, duringWall, {
+      ...initialAbortAttribution(),
+      runAborted: true,
+      deadlineHit: true,
+    });
+    expect(rosterRow(duringWall.get(left.name))).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'No response recorded before the run ended',
+      cause: undefined,
+      note: undefined,
+      timeoutMs: undefined,
+    });
+  });
+
+  it('pins the status/error/note/cause/weight combination for every SourceStatus', async () => {
+    const answered = makeSource('answered', 1, 2, answers('answered', 'Paris'));
+    const timedout = makeSource('timedout', 1, 2, async () =>
+      err(new TimeoutError('Request to "timedout" was aborted', 250)),
+    );
+    const nokey = makeSource('nokey', 1, 2, answers('nokey', 'unused'), false);
+    const self = makeSource('self', 1, 2, answers('self', 'unused'));
+    const straggler = makeSource('straggler', 1, 2, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [answered, timedout, nokey, self, straggler],
+      arbiter: makeArbiter([{ answered: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt, callerSource: 'self' }))._unsafeUnwrap();
+
+    // ok: answered and was rated; failure slots empty, configured weight kept.
+    expect(rosterRow(byName(result.sources, 'answered'))).toEqual({
+      status: 'ok',
+      weight: 2,
+      agreement: 0.9,
+      error: undefined,
+      cause: undefined,
+      note: undefined,
+      timeoutMs: undefined,
+    });
+    // error (peer-side): failure slots filled, weight kept (leadFailure ranks by it).
+    expect(rosterRow(byName(result.sources, 'timedout'))).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'Request to "timedout" was aborted',
+      cause: 'deadline',
+      note: undefined,
+      timeoutMs: 250,
+    });
+    // unavailable: never called for a caller-side reason — configured weight kept.
+    expect(rosterRow(byName(result.sources, 'nokey'))).toEqual({
+      status: 'unavailable',
+      weight: 2,
+      agreement: null,
+      error: 'Credential not resolvable; source skipped',
+      cause: 'credential',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+    // skipped: excluded as a redundant peer — configured weight kept, no note.
+    expect(rosterRow(byName(result.sources, 'self'))).toEqual({
+      status: 'skipped',
+      weight: 2,
+      agreement: null,
+      error: 'Skipped: excluded as a redundant peer for this request (callerSource/skipLocal)',
+      cause: 'configuration',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+    // cancelled: non-failure — reason in note, zero effective weight, no failure slots.
+    expect(rosterRow(byName(result.sources, 'straggler'))).toEqual({
+      status: 'cancelled',
+      weight: 0,
+      agreement: null,
+      error: undefined,
+      cause: undefined,
+      note: QUORUM_MET_NOTE,
+      timeoutMs: undefined,
+    });
   });
 });

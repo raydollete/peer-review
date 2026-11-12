@@ -292,7 +292,7 @@ You already have an answer and want independent endorsement. The peers never see
 
 `quorum.achieved: true` with `callerAgreement: 0.1` is the signal to catch: the peers are confident, but **not** with you — treat it as a flag to revise your answer. Had you been right, `callerAgreement` would sit near 1 alongside the same high `certaintyScore`. Note `caller` never appears in `sources[]` and its rating never moved `agreeingWeight`.
 
-**Reading the result**: gate any automated decision on `quorum.achieved`, treat `certaintyScore` as the confidence dial (it discounts both shortfall and lukewarm agreement), scan `sources[]` for `error`/`unavailable` entries — a degraded quorum is always visible, never silent; a `cancelled` entry is a peer the run no longer needed once quorum was met, not a failure, so do not count it as degradation — and, when you passed a `callerAnswer`, read `callerAgreement` as the separate "did the peers land where I did?" signal (scenario 5).
+**Reading the result**: gate any automated decision on `quorum.achieved`, treat `certaintyScore` as the confidence dial (it discounts both shortfall and lukewarm agreement), scan `sources[]` for `error`/`unavailable` entries — a degraded quorum is always visible, never silent; a `cancelled` row is a peer the run no longer needed once quorum was met, not a failure — its reason lives in `note` and it carries `weight: 0`, so do not count it as degradation — and, when you passed a `callerAnswer`, read `callerAgreement` as the separate "did the peers land where I did?" signal (scenario 5).
 
 ## Tools
 
@@ -332,10 +332,18 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
 A third, slower tier-1 peer that was still answering when `gemini-a` and `gemini-b` met the bar would appear alongside them as:
 
 ```jsonc
-{ "name": "slow-reasoner", "model": "glm-flash", "status": "cancelled", "weight": 1, "agreement": null }
+{ "name": "slow-reasoner", "model": "glm-flash", "status": "cancelled", "weight": 0, "agreement": null, "note": "Cancelled: quorum was met before this source responded" }
 ```
 
-`sources[].status` is `ok`, `error`, `unavailable`, `skipped` (excluded from this request via `callerSource`/`PEER_REVIEW_SKIP_LOCAL` — never called, zero quorum weight), or `cancelled` (still in flight when quorum was met, so the early-abort cancelled it — not a failure, zero quorum weight); `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
+`sources[].status` is one of:
+
+- `ok` — the source answered and the arbiter rated it.
+- `error` — the source was consulted and failed.
+- `unavailable` — never called because its credential was unresolvable.
+- `skipped` — excluded from this request via `callerSource`/`PEER_REVIEW_SKIP_LOCAL`; never called.
+- `cancelled` — still in flight when quorum was met (the early-abort cancelled it) or the caller cancelled the call; a non-failure, not a peer defect — its reason lives in `note`.
+
+`weight` is the source's effective contribution to the run: `0` on a `cancelled` row (a peer the run no longer needed contributed no vote), otherwise its configured weight — so `skipped` and `unavailable` keep theirs. `note` appears only on a `cancelled` row and carries why it was cancelled (e.g. "Cancelled: quorum was met before this source responded"); it lives outside `error`, so a reader counting failures off `error` MUST NOT count these rows. `agreement` is the arbiter's 0–1 rating (`null` if the source produced no rated response). If the arbiter itself fails, the response falls back to the highest-weighted successful answer with `certaintyScore: 0` and `quorum.arbiterFailed: true`.
 
 **Including your own answer (`callerAnswer`).** When you already have an answer and want to know whether independent peers endorse it, pass it as `callerAnswer` instead of pasting it into `prompt`. Peers never see it — they answer the prompt blind, so their independence is preserved and `certaintyScore` stays an anchoring-free signal. The arbiter is instructed to derive the consensus **only** from the peer answers and then rate your answer against that consensus, so a confidently-wrong `callerAnswer` cannot pull the consensus toward itself. The response gains a `callerAgreement` field (0–1).
 

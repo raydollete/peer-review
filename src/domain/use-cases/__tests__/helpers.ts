@@ -1,8 +1,8 @@
 import { ok, err, type Result } from 'neverthrow';
 import type { PeerSource, IPeerClient } from '../../ports/index.js';
 import type { PeerRequest, PeerResponse } from '../../entities/index.js';
-import { PeerApiError } from '../../errors/index.js';
-import { ExternalServiceError, type DomainError } from '../../../shared/errors/index.js';
+import { CancellationError, PeerApiError } from '../../errors/index.js';
+import type { DomainError } from '../../../shared/errors/index.js';
 
 export type CompleteFn = (request: PeerRequest) => Promise<Result<PeerResponse, DomainError>>;
 
@@ -71,18 +71,36 @@ export function resolvesAfterDelay(ms: number, text = 'slow answer'): CompleteFn
     });
 }
 
-/** Resolves only once the request signal aborts, with the cancellation error the
- * HTTP adapter returns for an orchestrator abort (src/infrastructure/adapters/http.ts). */
+/** Dies on the run's abort with the REAL adapter error — `CancellationError` as
+ * produced by src/infrastructure/adapters/http.ts — not a stand-in: an
+ * implementation steered by the wrong error shape would pass on a bare
+ * `ExternalServiceError` and still misreport in production. Executor form on
+ * purpose: the project's `lib` is ES2022, which has no `Promise.withResolvers`
+ * type, and this file is typechecked (test files are excluded). */
 export const resolvesOnAbortOnly: CompleteFn = (request) =>
   new Promise((resolve) => {
-    const fail = (): void =>
-      resolve(err(new ExternalServiceError('Request was cancelled by the orchestrator', 'peer')));
+    const message = 'Request to "peer" was cancelled by the orchestrator';
+    const fail = (): void => resolve(err(new CancellationError(message, 'peer')));
     if (request.signal?.aborted === true) {
       fail();
       return;
     }
     request.signal?.addEventListener('abort', fail);
   });
+
+/** Arbiter that answers `ratings` after `ms`, ignoring abort — a slow evaluation
+ * that the peer signal (deadline or tier budget) can fire during. */
+export function slowArbiter(ms: number, ratings: Record<string, number>): TestSource {
+  return makeSource('arbiter', 99, 1, () =>
+    new Promise((resolve) => {
+      setTimeout(() => {
+        const body = Object.entries(ratings).map(([name, agreement]) => ({ name, agreement }));
+        const consensus = { consensus: 'CONSENSUS', ratings: body };
+        resolve(ok(peerResponse('arbiter', JSON.stringify(consensus))));
+      }, ms);
+    }),
+  );
+}
 
 export type ArbiterScript = Array<Record<string, number> | 'transport-error' | 'garbage'>;
 

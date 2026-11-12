@@ -49,7 +49,11 @@ function abortPromise(signal: AbortSignal): Promise<void> {
 }
 
 /** Honest attribution: an external (orchestrator) abort is cancellation, never a
- * source-attributed timeout — a healthy-but-contended source is not scapegoated. */
+ * source-attributed timeout — a healthy-but-contended source is not scapegoated.
+ * Inside a quorum `cfg.signal` is the COMBINED tier-clock-or-run signal
+ * (`peer-review-quorum.use-case.ts`: `AbortSignal.any([controller.signal, peerClock])`),
+ * so a `CancellationError` on its own never proves the run caused the abort —
+ * only `abortedByRun` in `source-reports.ts` decides that. */
 function cancelledError(serviceName: string): DomainError {
   return new CancellationError(
     `Request to "${serviceName}" was cancelled by the orchestrator`,

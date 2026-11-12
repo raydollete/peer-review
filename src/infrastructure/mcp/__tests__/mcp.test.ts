@@ -10,7 +10,7 @@ import type { ILogger } from '../../../shared/logger/index.js';
 import { errorResponse, successResponse } from '../../../shared/types/index.js';
 import { PeerReviewController } from '../../controllers/index.js';
 import { PeerReviewQuorumUseCase } from '../../../domain/use-cases/index.js';
-import { makeSource, makeArbiter, answers } from '../../../domain/use-cases/__tests__/helpers.js';
+import { makeSource, makeArbiter, answers, resolvesOnAbortOnly } from '../../../domain/use-cases/__tests__/helpers.js';
 
 const silentLogger: ILogger = {
   info: () => undefined,
@@ -162,9 +162,12 @@ describe('failure envelope contract (report-peer-review-failure-cause-and-fix)',
   it('keeps the achieved-quorum envelope key set at the pre-change set (task 9b)', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
     const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+    // A third peer still in flight when a+b meet the bar: the early-abort cancels
+    // it, so a cancelled row — the only row that carries `note` — is in the roster.
+    const slow = makeSource('slow', 1, 1, resolvesOnAbortOnly);
     const controller = new PeerReviewController(
       new PeerReviewQuorumUseCase({
-        sources: [a, b],
+        sources: [a, b, slow],
         arbiter: makeArbiter([{ a: 0.9, b: 0.9 }]),
         thresholds: { 1: 4 },
         deadlineMs: 5000,
@@ -188,6 +191,7 @@ describe('failure envelope contract (report-peer-review-failure-cause-and-fix)',
       'data.quorum.sources[*].agreement',
       'data.quorum.sources[*].model',
       'data.quorum.sources[*].name',
+      'data.quorum.sources[*].note',
       'data.quorum.sources[*].status',
       'data.quorum.sources[*].weight',
       'data.quorum.tier',

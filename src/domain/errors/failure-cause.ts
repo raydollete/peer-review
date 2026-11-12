@@ -37,6 +37,10 @@ export type PeerReviewFailureCause =
   | 'arbiter_unavailable'
   | 'arbiter_malformed'
   | 'deadline'
+  /** The run itself ended the request — early-abort after quorum, or the caller
+   * cancelled. The gRPC `CANCELLED` analogue: a non-failure class, so a peer the
+   * run no longer needed never reads as a peer defect. */
+  | 'cancelled'
   | 'validation'
   | 'configuration'
   | 'internal';
@@ -101,6 +105,8 @@ const CAUSE_FIXES: Record<PeerReviewFailureCause, string> = {
     'Check the arbiter source reachability and credentials in peer-review.config.json',
   deadline:
     'Raise PEER_REVIEW_DEADLINE_MS (staying strictly below PEER_REVIEW_CALLER_TIMEOUT_MS) or lower the per-source timeoutMs',
+  cancelled:
+    'Nothing failed: the run ended before these sources answered. Rerun with a wider tier or a faster roster in peer-review.config.json',
   validation: 'Correct the named argument and retry',
   configuration:
     'Fix peer-review.config.json or the named environment variable, then restart the server',

@@ -1,6 +1,7 @@
 import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
 import { ArbiterMalformedError, TimeoutError, type DomainError } from '../errors/index.js';
 import type { ArbiterErrorRecord } from '../entities/index.js';
+import { isRunCancellation } from './source-reports.js';
 import type { QuorumDeps, QuorumInput, RunState } from './peer-review-quorum.use-case.js';
 
 /** One arbiter evaluation over every success so far: rates each source, folds
@@ -24,6 +25,13 @@ export async function evaluateRun(
     logger: deps.logger,
   });
   if (evaluation.isErr()) {
+    // The run (or the caller) ended the arbiter's request: "no evaluation this
+    // pass", not an arbiter outage — a failure here would discard a valid earlier
+    // lastEval and make runTiers fan out further tiers after the caller left.
+    if (isRunCancellation(state, evaluation.error)) {
+      deps.logger?.debug('Arbiter evaluation skipped: the run was cancelled', { arbiter: deps.arbiter.name });
+      return;
+    }
     state.arbiterFailed = true;
     // Preserve the arbiter's DomainError instead of dropping it: the roster
     // gets a row, and the caller can tell an unavailable arbiter from a reply

@@ -1,6 +1,13 @@
 import type { PeerSource } from '../ports/index.js';
 import { TierBudgetElapsedError } from '../errors/index.js';
-import { markCancelled, markFailed, type MutableReport } from './source-reports.js';
+import {
+  abortedByRun,
+  cancellationNote,
+  markCancelled,
+  markFailed,
+  type AbortAttribution,
+  type MutableReport,
+} from './source-reports.js';
 
 /** Floor for a tier's time budget: the escalation timebox must never go
  * non-positive (which would abandon a tier before it can launch), even when the
@@ -36,37 +43,54 @@ export function signalAbortPromise<T>(signal: AbortSignal, value: T): Promise<T>
 }
 
 /**
- * Tier budget elapsed with peers still in flight: a slow, contended backend.
- * Mark each still-launched source outage-shaped (its weight unattainable within
- * budget) so escalation to a healthy higher tier proceeds instead of blocking.
+ * The tier's signal fired with peers still in flight. Two different endings
+ * arrive here and MUST be reported apart: the tier's own time budget elapsed
+ * (a slow, contended backend → mark each still-launched source outage-shaped so
+ * its weight is unattainable within budget and escalation proceeds), or the run
+ * / caller walked away (not the peer's fault → itemize as cancelled, never as a
+ * tier-budget outage). Attribution comes from the run's origin flags, not from
+ * the error the request settled with.
  */
 export function markPendingOutage(
   inflight: Map<number, PeerSource>,
   reports: Map<string, MutableReport>,
+  attribution: AbortAttribution,
 ): void {
   for (const source of inflight.values()) {
     const report = reports.get(source.name);
-    if (report !== undefined && report.status === 'error') {
-      markFailed(
-        report,
-        new TierBudgetElapsedError('tier budget elapsed — still in flight', source.name),
-      );
+    if (report === undefined || report.status !== 'error') {
+      continue;
     }
+    if (abortedByRun(attribution)) {
+      markCancelled(report, cancellationNote(attribution));
+      continue;
+    }
+    markFailed(
+      report,
+      new TierBudgetElapsedError('tier budget elapsed — still in flight', source.name),
+    );
   }
 }
 
 /**
  * Quorum met with peers still in flight: the early-abort cancels them. Mark each
  * still-launched source that never settled as cancelled — not needed, not failed.
+ * The wall still wins: if it expired first, these rows are the wall's stragglers
+ * and must keep the failure shape `markDeadlineStragglers` gives them — a
+ * cancelled row there would hide a real deadline miss (F3).
  */
 export function markPendingCancelled(
   inflight: Map<number, PeerSource>,
   reports: Map<string, MutableReport>,
+  attribution: AbortAttribution,
 ): void {
+  if (attribution.deadlineHit) {
+    return;
+  }
   for (const source of inflight.values()) {
     const report = reports.get(source.name);
     if (report !== undefined && report.status === 'error') {
-      markCancelled(report);
+      markCancelled(report, cancellationNote(attribution));
     }
   }
 }

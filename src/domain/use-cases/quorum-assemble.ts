@@ -73,11 +73,13 @@ export function assembleResult(
 
 /**
  * The total-outage branch: keep the message existing readers grep for, but stop
- * throwing the roster away. The three states this branch collapses are named
+ * throwing the roster away. The four states this branch collapses are named
  * apart — every source skipped (a caller/skipLocal configuration fault), every
- * source unavailable (credentials unset: a credential fault), and a real peer
+ * source unavailable (credentials unset: a credential fault), every source
+ * cancelled (the run or the caller ended first: nothing failed), and a real peer
  * outage (sources consulted and failed) — each with its own cause and fix, so a
- * configuration fault is never reported as a network fault.
+ * configuration fault is never reported as a network fault and a run cancellation
+ * is never reported as a peer defect.
  */
 function noResponseError(
   consulted: readonly QuorumSourceReport[],
@@ -100,6 +102,18 @@ function noResponseError(
       cause: 'credential',
       detail,
       fix: 'Set the credential env vars or repair apiKeyCommand for the unavailable sources in peer-review.config.json, then restart the server',
+      context,
+    });
+  }
+  if (consulted.length > 0 && consulted.every((s) => s.status === 'cancelled')) {
+    // Nothing failed — the run walked away from every consulted source before any
+    // of them answered. leadFailure filters cancelled rows out, so falling through
+    // would call this 'internal' and point at a correlationId the context never
+    // carries. The cause plus the fix name the run as the author.
+    return new QuorumFailureError(message, 'peer-review', {
+      cause: 'cancelled',
+      detail,
+      fix: fixFor('cancelled'),
       context,
     });
   }

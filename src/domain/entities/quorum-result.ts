@@ -47,10 +47,14 @@ export interface QuorumSourceReport {
   readonly name: string;
   readonly model: string;
   readonly status: SourceStatus;
+  /** The source's EFFECTIVE contribution to this run: its configured weight, except
+   * on a `cancelled` row, where it is 0 because a peer the run no longer needed
+   * contributed no vote. `skipped` and `unavailable` keep the configured weight. */
   readonly weight: number;
   /** Arbiter agreement rating in [0, 1]; null when the source produced no rated response. */
   readonly agreement: number | null;
-  /** Why a non-ok source failed. Absent when status is "ok" — a bare "error"
+  /** Why a non-ok source FAILED — a failure slot, forbidden on a `cancelled` row
+   * (whose reason lives in `note`). Absent when status is "ok" — a bare "error"
    * status is undiagnosable from the caller side, which only sees this envelope. */
   readonly error?: string | undefined;
   /** Machine cause of this source's failure, from the typed error that produced
@@ -63,6 +67,10 @@ export interface QuorumSourceReport {
   /** For a source that timed out: the budget it exceeded, so the caller can
    * tell which clock expired rather than parsing prose. */
   readonly timeoutMs?: number | undefined;
+  /** Why a non-failure row is what it is: set on `cancelled` (the run or the
+   * caller ended the request). A reader counting failures off a populated `error`
+   * MUST NOT count these rows. */
+  readonly note?: string | undefined;
 }
 
 export interface QuorumResult {

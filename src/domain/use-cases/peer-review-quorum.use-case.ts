@@ -4,8 +4,8 @@ import type { PeerSource } from '../ports/index.js';
 import { ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
 import type { DomainError } from '../errors/index.js';
 import type { AgreementEvaluation } from './agreement.js';
-import { attachCallerAbort, markDeadlineStragglers, markFailed, markOk, markSkipped, markTierSkippedForTime, noteUnknownCallerSource, seedReport } from './source-reports.js';
-import type { MutableReport } from './source-reports.js';
+import { initialAbortAttribution, markCancelledStragglers, markDeadlineStragglers, markSkipped, markTierSkippedForTime, noteUnknownCallerSource, recordSettled, seedReport, watchAbortOrigins } from './source-reports.js';
+import type { AbortOriginFlags, MutableReport, Settled } from './source-reports.js';
 import {
   computeTierBudget,
   markPendingCancelled,
@@ -44,9 +44,11 @@ export interface QuorumDeps {
    * per-harness via PEER_REVIEW_SKIP_LOCAL when the caller runs on the local
    * backend, so it does not contend with itself. */
   readonly skipLocal?: boolean | undefined;
-  readonly logger?: Pick<ILogger, 'warn'> | undefined;
+  /** `debug` so a peer the run itself cancelled is recorded below the alertable
+   * `warn`, which stays reserved for genuine peer failures. */
+  readonly logger?: Pick<ILogger, 'warn' | 'debug'> | undefined;
 }
-export interface RunState {
+export interface RunState extends AbortOriginFlags {
   readonly reports: Map<string, MutableReport>;
   readonly successes: Array<{ source: PeerSource; response: PeerResponse }>;
   readonly usage: { promptTokens: number; completionTokens: number; totalTokens: number };
@@ -61,13 +63,8 @@ export interface RunState {
    * the run's own straggler, not a peer that failed. */
   settled: Set<string>;
   evaluatedCount: number;
-  deadlineHit: boolean;
   /** Highest tier launched so far — read at the wall too, before the run returns. */
   reachedTier: number;
-}
-interface Settled {
-  readonly source: PeerSource;
-  readonly result: Result<PeerResponse, DomainError>;
 }
 
 export class PeerReviewQuorumUseCase {
@@ -97,11 +94,13 @@ export class PeerReviewQuorumUseCase {
       arbiterFailed: false,
       settled: new Set<string>(),
       evaluatedCount: 0,
-      deadlineHit: false,
+      ...initialAbortAttribution(),
       reachedTier: targetTier,
     };
     const controller = new AbortController();
-    const detachCallerAbort = attachCallerAbort(controller, callerSignal);
+    // Origin is recorded by listeners at the moment each abort fires, so "who
+    // killed this request" never depends on which observation the race saw first.
+    const detachCallerAbort = watchAbortOrigins(state, controller, callerSignal);
     const start = Date.now();
     const timer = setTimeout(() => {
       state.deadlineHit = true;
@@ -122,6 +121,10 @@ export class PeerReviewQuorumUseCase {
       detachCallerAbort();
       controller.abort();
     }
+    // One abort, one verdict: peers the unwinding run never observed settling on
+    // its own abort are itemized exactly like the ones it did (and the wall's own
+    // stragglers are left to markDeadlineStragglers below).
+    markCancelledStragglers(state);
     markDeadlineStragglers(state, this.deps.deadlineMs);
     return assembleResult(input, state, state.reachedTier, requiredWeight, this.deps.sources);
   }
@@ -175,7 +178,13 @@ export class PeerReviewQuorumUseCase {
         this.deps.tierTimeoutMs?.[tier] ?? fallbackTierBudget, remainingBudget,
       );
       const arbiterTimeoutMs = this.deps.arbiterTimeoutMs ?? fallbackTierBudget;
-      const peerSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(peerTimeoutMs)]);
+      // This tier's own clock, recorded when IT fires. Reset per tier: the
+      // previous tier's exhausted budget is not this tier's cause, so a later
+      // run/caller abort still attributes as cancelled.
+      state.tierClockFired = false;
+      const peerClock = AbortSignal.timeout(peerTimeoutMs);
+      peerClock.addEventListener('abort', () => { state.tierClockFired = true; }, { once: true });
+      const peerSignal = AbortSignal.any([controller.signal, peerClock]);
       await this.runTier(tier, input, state, controller, requiredWeight, peerSignal, arbiterTimeoutMs);
       if (state.achieved || state.deadlineHit) {
         break;
@@ -262,7 +271,9 @@ export class PeerReviewQuorumUseCase {
           return;
         }
         const kept = await this.keepSettledAnswers(pending, inflight, state);
-        markPendingOutage(inflight, state.reports);
+        // Passes the origin flags: a caller that had already left must not stamp
+        // every in-flight peer as a tier-budget outage it never caused.
+        markPendingOutage(inflight, state.reports, state);
         if (kept && this.quorumPossible(state, requiredWeight)) {
           await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         }
@@ -270,7 +281,7 @@ export class PeerReviewQuorumUseCase {
       }
       pending.delete(winner.key);
       inflight.delete(winner.key);
-      this.record(state, winner.settled);
+      recordSettled(state, winner.settled, this.deps.logger);
       // Consume every already-settled peer before evaluating, so a same-tick
       // sibling response is never discarded by an early-abort.
       await this.drainSettled(pending, inflight, state);
@@ -280,13 +291,7 @@ export class PeerReviewQuorumUseCase {
       if (!state.achieved && pending.size > 0 && this.quorumPossible(state, requiredWeight)) {
         await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
         if (state.achieved) {
-          // Early-abort: quorum met, cancel remaining in-flight peers to save cost.
-          // Record peers that answered during evaluation first — unless the peer
-          // signal fired meanwhile, so what settled is its own cancellation. The
-          // rest were not needed, not failed: they are itemized as cancelled.
-          await this.drainSettled(pending, inflight, state, peerSignal);
-          markPendingCancelled(inflight, state.reports);
-          controller.abort();
+          await this.cancelSurvivors(pending, inflight, state, controller, peerSignal);
           return;
         }
       }
@@ -295,6 +300,24 @@ export class PeerReviewQuorumUseCase {
     if (!state.achieved && !state.deadlineHit && state.successes.length > state.evaluatedCount) {
       await evaluateRun(this.deps, input, state, controller.signal, arbiterTimeoutMs, requiredWeight);
     }
+  }
+
+  /** Quorum met: the early-abort cancels the peers still in flight to save cost.
+   * Record peers that answered during the evaluation first — unless the peer
+   * signal fired meanwhile, so what settled is its own cancellation. The rest were
+   * not needed, not failed: itemized as cancelled by markPendingCancelled, which
+   * is also where the wall (deadlineHit) keeps its own stragglers — a cancelled
+   * row there would hide a real deadline miss. */
+  private async cancelSurvivors(
+    pending: Map<number, Promise<{ key: number; settled: Settled }>>,
+    inflight: Map<number, PeerSource>,
+    state: RunState,
+    controller: AbortController,
+    peerSignal: AbortSignal,
+  ): Promise<void> {
+    await this.drainSettled(pending, inflight, state, peerSignal);
+    markPendingCancelled(inflight, state.reports, state);
+    controller.abort();
   }
 
   /** A tier slice ended while an evaluation outlasted it: keep every peer that
@@ -312,7 +335,7 @@ export class PeerReviewQuorumUseCase {
       if (winner !== sentinel && winner.settled.result.isOk()) {
         pending.delete(key);
         inflight.delete(key);
-        this.record(state, winner.settled);
+        recordSettled(state, winner.settled, this.deps.logger);
         kept = true;
       }
     }
@@ -337,7 +360,7 @@ export class PeerReviewQuorumUseCase {
       }
       pending.delete(winner.key);
       inflight.delete(winner.key);
-      this.record(state, winner.settled);
+      recordSettled(state, winner.settled, this.deps.logger);
     }
   }
 
@@ -359,26 +382,4 @@ export class PeerReviewQuorumUseCase {
     return this.attainableWeight(state) >= requiredWeight;
   }
 
-  private record(state: RunState, settled: Settled): void {
-    const report = state.reports.get(settled.source.name);
-    if (report === undefined) {
-      return;
-    }
-    state.settled.add(settled.source.name);
-    if (settled.result.isOk()) {
-      markOk(report);
-      state.successes.push({ source: settled.source, response: settled.result.value });
-      const usage = settled.result.value.usage;
-      state.usage.promptTokens += usage.promptTokens;
-      state.usage.completionTokens += usage.completionTokens;
-      state.usage.totalTokens += usage.totalTokens;
-    } else {
-      markFailed(report, settled.result.error);
-      this.deps.logger?.warn('Peer failed during quorum', {
-        source: settled.source.name,
-        status: report.status,
-        error: settled.result.error.message,
-      });
-    }
-  }
 }
