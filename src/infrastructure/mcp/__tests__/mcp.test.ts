@@ -49,6 +49,16 @@ describe('tool registry', () => {
       'list_peers',
       'count_tokens',
     ]);
+    expect(
+      Object.fromEntries(
+        registry.listTools().map((t) => [t.name, t.annotations]),
+      ),
+    ).toEqual({
+      peer_review: { readOnlyHint: true, openWorldHint: true },
+      query_peer: { readOnlyHint: true, openWorldHint: true },
+      list_peers: { readOnlyHint: true, openWorldHint: false },
+      count_tokens: { readOnlyHint: true, openWorldHint: true },
+    });
     expect(registry.has('peer_review')).toBe(true);
   });
 

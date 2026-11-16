@@ -23,6 +23,7 @@ Use this tool when you need:
 - Design/code review sign-off where agreement between models matters
 
 Sources are consulted in cost tiers: cheap tier-1 peers first, escalating to higher tiers only if agreement falls short of the configured weight threshold. The response itemizes every consulted source with its status and agreement rating, so degraded quorums (failed or unavailable peers) are always visible. An unmet quorum is NOT an error — inspect quorum.achieved and certaintyScore.`,
+  annotations: { readOnlyHint: true, openWorldHint: true },
   inputSchema: {
     type: 'object',
     properties: {
@@ -66,6 +67,7 @@ Use this tool when you need:
 - The cheap path: exactly one LLM call instead of a full peer_review fan-out
 
 Defaults to the lowest-tier highest-weight source; pass "source" to pick a configured peer by name (see list_peers).`,
+  annotations: { readOnlyHint: true, openWorldHint: true },
   inputSchema: {
     type: 'object',
     properties: {
@@ -89,6 +91,7 @@ export const listPeersTool: Tool = {
   name: 'list_peers',
   description:
     'List the configured peer sources with their API type, model, weight, tier, and current availability (whether a credential is resolvable). Use before query_peer to discover valid source names.',
+  annotations: { readOnlyHint: true, openWorldHint: false },
   inputSchema: {
     type: 'object',
     properties: {},
@@ -100,6 +103,7 @@ export const countTokensTool: Tool = {
   description: `Count tokens in a text using a configured source's tokenizer.
 
 The response's "method" field tells you how the count was produced: "api" (provider count endpoint, exact) or "estimate" (ceil(chars/4) heuristic for providers without a count endpoint).`,
+  annotations: { readOnlyHint: true, openWorldHint: true },
   inputSchema: {
     type: 'object',
     properties: {

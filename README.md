@@ -186,7 +186,7 @@ Tier 1 fans out to `gemini-flash` and `gpt-mini`; both agree, but their combined
 
 `{ "prompt": "Is 'reciept' spelled correctly?", "tier": 1 }`
 
-Now the required weight is tier 1's threshold (2). Both flash sources agree, quorum is achieved in one round, and tiers 2–3 are never contacted regardless of the outcome. This is the cheap path for queries where two small models agreeing is good enough.
+Now the required weight is tier 1's threshold (2). Both flash sources agree, quorum is achieved in one round, and tiers 2–3 stay uncontacted. This is the cheap path for queries where two small models agreeing is good enough. The ceiling holds when every tier-1 source answers — a disagreement-shaped miss is revisable, so escalating it would only cost more. An outage-shaped miss is not: if one tier-1 source errors and the attainable weight (the summed weight of sources that answered) falls below tier 1's required weight, the run escalates to the next configured tier to restore the capacity to reach the bar, while `requiredWeight` stays tier 1's 2.
 
 ```jsonc
 // data
@@ -294,11 +294,15 @@ You already have an answer and want independent endorsement. The peers never see
 
 **Reading the result**: gate any automated decision on `quorum.achieved`, treat `certaintyScore` as the confidence dial (it discounts both shortfall and lukewarm agreement), scan `sources[]` for `error`/`unavailable` entries — a degraded quorum is always visible, never silent; a `cancelled` row is a peer the run no longer needed once quorum was met, not a failure — its reason lives in `note` and it carries `weight: 0`, so do not count it as degradation — and, when you passed a `callerAnswer`, read `callerAgreement` as the separate "did the peers land where I did?" signal (scenario 5).
 
+**A failed quorum withholds its prose.** When `quorum.achieved` is `false`, `response` comes back as `""` and the envelope carries `"responseWithheld": true` — text no quorum validated is unvalidated opinion, so the server no longer hands back synthesized consensus (or one peer's representative answer) for a caller to fold into its own reasoning. Everything needed to transcribe the verdict honestly is still returned: `quorum` with `requiredWeight`, `agreeingWeight`, and the full `sources[]` roster, `certaintyScore`, and `callerAgreement` when a `callerAnswer` was supplied. An achieved quorum is unchanged — the same `response` prose as before, with no `responseWithheld` key at all.
+
 ## Tools
 
 All tools return the envelope `{"success": true, "data": ...}` or `{"success": false, "error": {"code", "message"}}`, JSON-stringified into a single text content block (compatible with the reference Gemini MCP). Error codes: `VALIDATION_ERROR`, `CONFIGURATION_ERROR`, `TIMEOUT_ERROR`, `EXTERNAL_SERVICE_ERROR`, `PEER_API_ERROR`, `PEER_RATE_LIMIT`, `TOOL_NOT_FOUND`, `INTERNAL_ERROR`. Model, temperature, and output limits are injected server-side — the input schemas are strict, so client-supplied `model`/`temperature` are rejected.
 
 **Failure envelopes carry the cause, not just the code.** Alongside `code` and `message` (unchanged), every failure the server can attribute carries `error.cause` from the closed vocabulary in the [Troubleshooting table](#troubleshooting), and where applicable `error.source` (the peer or arbiter at fault), `error.detail` (one provider-agnostic line — HTTP status or the unwrapped transport `errno`, never provider body text or credential material), `error.fix` (the operator action), and, for a `peer_review` failure with at least one source consulted, `error.context` — the same weight math and `sources[]` roster the success path puts in `data.quorum`, so the no-success response is as diagnosable as the success one. An `INTERNAL_ERROR` is the redacted catch-all: its message is always the generic line, and its `error.context.correlationId` points at the full error in the server's stderr log (see the Troubleshooting table). `code` stays the coarse wire class for readers that switch on it; `cause` is what a repair guide should read. When a source fails as the arbiter, `data.quorum.arbiter` (on the arbiter-fallback success path) or `error.context.arbiter` (on the failure path) reports `{name, status: "failed", error: {code, cause, detail}}` — the `certaintyScore: 0` / `arbiterFailed: true` flags keep their exact meaning; a row is added, never moved.
+
+**Every tool advertises MCP `annotations`.** All four declare `readOnlyHint: true` — none of them modifies the caller's environment — and `openWorldHint: true`, except `list_peers` (`openWorldHint: false`, it reads configuration only). A harness that gates concurrency on `readOnlyHint` (Claude Code does) may therefore run several calls issued in one message at once. Inputs, outputs, and quorum behavior are unchanged.
 
 **Changes to `peer-review.config.json` require restarting the server** — it is read once at startup, and credential availability is evaluated at boot.
 
