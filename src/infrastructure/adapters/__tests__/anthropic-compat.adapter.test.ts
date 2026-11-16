@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { AnthropicCompatAdapter } from '../anthropic-compat.adapter.js';
 import { PeerRateLimitError } from '../../../domain/errors/index.js';
+import { ExternalServiceError } from '../../../shared/errors/index.js';
 import { StubCredentialProvider, jsonResponse, instantDeps } from './test-helpers.js';
 
 const successFixture = {
@@ -11,7 +12,10 @@ const successFixture = {
   usage: { input_tokens: 15, output_tokens: 5 },
 };
 
-function makeAdapter(fetchFn: typeof fetch): AnthropicCompatAdapter {
+function makeAdapter(
+  fetchFn: typeof fetch,
+  logger?: { warn: (message: string, context?: Record<string, unknown>) => void },
+): AnthropicCompatAdapter {
   return new AnthropicCompatAdapter(
     {
       sourceName: 'claude',
@@ -20,6 +24,7 @@ function makeAdapter(fetchFn: typeof fetch): AnthropicCompatAdapter {
       timeoutMs: 5000,
       maxOutputTokens: 2048,
       credentialProvider: new StubCredentialProvider('ak-test'),
+      ...(logger !== undefined ? { logger } : {}),
     },
     instantDeps(fetchFn),
   );
@@ -97,5 +102,34 @@ describe('AnthropicCompatAdapter', () => {
     const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
     const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
     expect(result._unsafeUnwrap().text).toBe('Part one. Part two.');
+  });
+
+  it('rejects an empty reply and names the stop_reason', async () => {
+    const fixture = { ...successFixture, content: [], stop_reason: 'max_tokens' };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error.message).toContain('stop_reason=max_tokens');
+  });
+
+  it('returns truncated text at max_tokens and warns once', async () => {
+    const fixture = {
+      ...successFixture,
+      content: [{ type: 'text', text: 'Partial answer' }],
+      stop_reason: 'max_tokens',
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const warn = jest.fn();
+    const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
+    const response = result._unsafeUnwrap();
+    expect(response.text).toBe('Partial answer');
+    expect(response.finishReason).toBe('max_tokens');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith('Peer response truncated at max_tokens', {
+      source: 'claude',
+      finishReason: 'max_tokens',
+      snippet: 'Partial answer',
+    });
   });
 });

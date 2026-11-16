@@ -14,6 +14,7 @@ import {
 import { AGREEMENT_THRESHOLD, computeCertainty, type AgreementEvaluation } from './agreement.js';
 import type { PeerSource } from '../ports/index.js';
 import type { QuorumInput, RunState } from './peer-review-quorum.use-case.js';
+import { UNRATED_RUN_ENDED } from './source-reports.js';
 
 /**
  * Freeze the in-flight run state into the reference `QuorumResult` envelope.
@@ -31,9 +32,13 @@ export function assembleResult(
   requiredWeight: number,
   peerSources: readonly PeerSource[],
 ): Result<QuorumResult, DomainError> {
-  const sources: QuorumSourceReport[] = [...state.reports.values()].map((report) => ({
-    ...report,
-  }));
+  // An ok row no completed evaluation rated (deadline mid-evaluation, or a peer
+  // that answered during the deciding one) still says why it has no rating.
+  const sources: QuorumSourceReport[] = [...state.reports.values()].map((report) =>
+    report.status === 'ok' && report.agreement === null && report.note === undefined
+      ? { ...report, note: UNRATED_RUN_ENDED }
+      : { ...report },
+  );
   const base = {
     achieved: state.achieved,
     tier,

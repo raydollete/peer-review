@@ -21,6 +21,8 @@ export interface MutableReport {
    * `cancelled` row (see markCancelled). */
   weight: number;
   agreement: number | null;
+  /** The arbiter's one-line reason; set only alongside a rating. */
+  reason?: string | undefined;
   /** Failure slot: why this source FAILED. Cleared by markOk and markCancelled. */
   error?: string | undefined;
   /** Machine cause from the typed error that failed this source; absent for
@@ -30,9 +32,47 @@ export interface MutableReport {
   code?: string | undefined;
   service?: string | undefined;
   timeoutMs?: number | undefined;
-  /** Non-failure reason, set on `cancelled` rows: the run or the caller ended
-   * the request. Kept out of `error` so failure-counting readers skip it. */
+  /** Non-failure reason, set on `cancelled` rows (the run or the caller ended
+   * the request) and on `ok` rows left unrated. Kept out of `error` so
+   * failure-counting readers skip it. */
   note?: string | undefined;
+}
+
+/** `note` texts for an `ok` row with no rating — prose for humans; the machine
+ * signal is `status: 'ok'` with `agreement: null`. */
+export const UNRATED_OMITTED = 'Unrated: the arbiter returned no rating for this source';
+export const UNRATED_ARBITER_FAILED = 'Unrated: the arbiter failed; see quorum.arbiter';
+export const UNRATED_RUN_ENDED = 'Unrated: the run ended before the arbiter rated this source';
+/** `note` on a row that keeps an earlier evaluation's rating after a later one failed. */
+export const RATED_BEFORE_ARBITER_FAILED =
+  'Rated by an earlier evaluation; the latest arbiter evaluation failed — see quorum.arbiter';
+
+/** A later evaluation failed: an earlier rating stays itemized (with its reason)
+ * but says it is not the latest verdict; a row never rated says it is unrated. */
+export function markArbiterFailed(report: MutableReport): void {
+  if (report.agreement === null) {
+    markRated(report, undefined, UNRATED_ARBITER_FAILED);
+  } else {
+    report.note = RATED_BEFORE_ARBITER_FAILED;
+  }
+}
+
+/** Record one evaluation's verdict on a successful source: a rating (with its
+ * reason, clearing any earlier note), or unrated with the note naming why. Every
+ * completed evaluation rewrites every success row. */
+export function markRated(
+  report: MutableReport,
+  rating: { readonly agreement: number; readonly reason?: string } | undefined,
+  unratedNote: string,
+): void {
+  report.agreement = rating?.agreement ?? null;
+  delete report.reason;
+  delete report.note;
+  if (rating === undefined) {
+    report.note = unratedNote;
+  } else if (rating.reason !== undefined) {
+    report.reason = rating.reason;
+  }
 }
 
 /** A source starts non-ok and only earns "ok" by settling successfully. The
@@ -71,6 +111,7 @@ export function markOk(report: MutableReport): void {
 
 export function markFailed(report: MutableReport, error: DomainError): void {
   report.status = error instanceof ConfigurationError ? 'unavailable' : 'error';
+  delete report.reason;
   report.error = error.message;
   // Typed fields, not only prose: the code, the service an external error
   // named, and the budget a TimeoutError exceeded ride into sources[].
@@ -96,6 +137,7 @@ export function markSkipped(
 ): void {
   report.status = 'skipped';
   report.agreement = null;
+  delete report.reason;
   report.error = reason;
   report.cause = cause;
 }
@@ -185,6 +227,7 @@ export function cancellationNote(state: AbortAttribution): string {
 export function markCancelled(report: MutableReport, reason: string): void {
   report.status = 'cancelled';
   report.agreement = null;
+  delete report.reason;
   report.weight = 0;
   report.note = reason;
   clearFailureSlots(report);

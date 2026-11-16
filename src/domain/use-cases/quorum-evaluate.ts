@@ -1,7 +1,7 @@
-import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
+import { AGREEMENT_THRESHOLD, evaluateAgreement, type AgreementEvaluation } from './agreement.js';
 import { ArbiterMalformedError, TimeoutError, type DomainError } from '../errors/index.js';
 import type { ArbiterErrorRecord } from '../entities/index.js';
-import { isRunCancellation } from './source-reports.js';
+import { isRunCancellation, markArbiterFailed, markRated, UNRATED_OMITTED } from './source-reports.js';
 import type { QuorumDeps, QuorumInput, RunState } from './peer-review-quorum.use-case.js';
 
 /** One arbiter evaluation over every success so far: rates each source, folds
@@ -19,7 +19,9 @@ export async function evaluateRun(
   const evaluation = await evaluateAgreement({
     arbiter: { name: deps.arbiter.name, client: deps.arbiter.client },
     question: input.prompt,
-    responses: state.successes.map((s) => s.response),
+    // Named by the configured source, which keys the roster — not by whatever
+    // the adapter echoed — so the arbiter's D<n> maps straight onto a row.
+    responses: state.successes.map((s) => ({ ...s.response, source: s.source.name })),
     callerAnswer: input.callerAnswer,
     signal,
     logger: deps.logger,
@@ -37,6 +39,14 @@ export async function evaluateRun(
     // gets a row, and the caller can tell an unavailable arbiter from a reply
     // that failed JSON extraction.
     state.arbiterError = arbiterErrorRecord(deps.arbiter.name, evaluation.error);
+    // Earlier ratings stay itemized for transparency, but no row may read as
+    // the latest verdict: the failed pass is, and it rated nobody.
+    for (const success of state.successes) {
+      const report = state.reports.get(success.source.name);
+      if (report !== undefined) {
+        markArbiterFailed(report);
+      }
+    }
     return;
   }
   state.arbiterFailed = false;
@@ -47,22 +57,37 @@ export async function evaluateRun(
   state.usage.completionTokens += evaluation.value.usage.completionTokens;
   state.usage.totalTokens += evaluation.value.usage.totalTokens;
 
+  state.agreeingWeight = applyRatings(deps, state, evaluation.value.ratings);
+  if (state.agreeingWeight >= requiredWeight) {
+    state.achieved = true;
+  }
+}
+
+/** Write one evaluation's verdict onto every success row and return the agreeing
+ * weight. A source the arbiter did not rate is unrated with a note and a logged
+ * warning — never a silent 0. */
+function applyRatings(
+  deps: Pick<QuorumDeps, 'arbiter' | 'logger'>,
+  state: RunState,
+  ratings: AgreementEvaluation['ratings'],
+): number {
   let agreeing = 0;
   for (const success of state.successes) {
-    const rating =
-      evaluation.value.ratings.find((r) => r.name === success.source.name)?.agreement ?? 0;
+    const rating = ratings.find((r) => r.name === success.source.name);
     const report = state.reports.get(success.source.name);
     if (report !== undefined) {
-      report.agreement = rating;
+      markRated(report, rating, UNRATED_OMITTED);
     }
-    if (rating >= AGREEMENT_THRESHOLD) {
+    if (rating === undefined) {
+      deps.logger?.warn('Arbiter returned no rating for a source', {
+        source: success.source.name,
+        arbiter: deps.arbiter.name,
+      });
+    } else if (rating.agreement >= AGREEMENT_THRESHOLD) {
       agreeing += success.source.weight;
     }
   }
-  state.agreeingWeight = agreeing;
-  if (agreeing >= requiredWeight) {
-    state.achieved = true;
-  }
+  return agreeing;
 }
 
 

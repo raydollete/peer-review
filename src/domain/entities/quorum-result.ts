@@ -51,8 +51,12 @@ export interface QuorumSourceReport {
    * on a `cancelled` row, where it is 0 because a peer the run no longer needed
    * contributed no vote. `skipped` and `unavailable` keep the configured weight. */
   readonly weight: number;
-  /** Arbiter agreement rating in [0, 1]; null when the source produced no rated response. */
+  /** Arbiter agreement rating in [0, 1]; null when the source produced no rated
+   * response. An `ok` row with null was answered but not rated; its `note` says why. */
   readonly agreement: number | null;
+  /** The arbiter's one-line explanation of `agreement`, present only on a rated
+   * row — returned even when the consensus prose is withheld. */
+  readonly reason?: string | undefined;
   /** Why a non-ok source FAILED — a failure slot, forbidden on a `cancelled` row
    * (whose reason lives in `note`). Absent when status is "ok" — a bare "error"
    * status is undiagnosable from the caller side, which only sees this envelope. */
@@ -68,8 +72,8 @@ export interface QuorumSourceReport {
    * tell which clock expired rather than parsing prose. */
   readonly timeoutMs?: number | undefined;
   /** Why a non-failure row is what it is: set on `cancelled` (the run or the
-   * caller ended the request). A reader counting failures off a populated `error`
-   * MUST NOT count these rows. */
+   * caller ended the request) and on an `ok` row the arbiter did not rate. A
+   * reader counting failures off a populated `error` MUST NOT count these rows. */
   readonly note?: string | undefined;
 }
 

@@ -62,6 +62,12 @@ describe('tool registry', () => {
     expect(registry.has('peer_review')).toBe(true);
   });
 
+  it('tells callers that rated rows carry a reason and unrated rows a note', () => {
+    expect(peerReviewTool.description).toContain(
+      "Each rated source carries the arbiter's one-line reason, even when the consensus prose is withheld; an ok source with agreement null was not rated, and its note says why.",
+    );
+  });
+
   it('exposes callerAnswer on peer_review with blind-to-peers semantics, and not on query_peer', () => {
     const properties = peerReviewTool.inputSchema.properties as Record<
       string,

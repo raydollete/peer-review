@@ -3,6 +3,8 @@ import { z } from 'zod';
 import type { IPeerClient } from '../../domain/ports/index.js';
 import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
+import type { ILogger } from '../../shared/logger/index.js';
+import { sanitizeModelText } from '../../shared/text/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 import { postJson, type HttpDeps } from './http.js';
 
@@ -23,6 +25,7 @@ export interface AnthropicCompatAdapterConfig {
   readonly timeoutMs: number;
   readonly maxOutputTokens: number;
   readonly credentialProvider: ICredentialProvider;
+  readonly logger?: Pick<ILogger, 'warn'>;
 }
 
 type WireMessage = { role: 'user' | 'assistant'; content: string };
@@ -118,6 +121,29 @@ export class AnthropicCompatAdapter implements IPeerClient {
       .filter((block) => block.type === 'text')
       .map((block) => block.text ?? '')
       .join('');
+    const stopReason = parsed.data.stop_reason;
+    const finishReason = stopReason ?? 'unknown';
+    // Sanitized only to decide emptiness; the reply text itself is returned as-is.
+    if (sanitizeModelText(text) === '') {
+      this.cfg.logger?.warn('Peer returned empty text after sanitization', {
+        source: this.cfg.sourceName,
+        finishReason,
+        snippet: text.slice(0, 300),
+      });
+      return err(
+        new ExternalServiceError(
+          `Peer returned no usable text (stop_reason=${finishReason})`,
+          this.cfg.sourceName,
+        ),
+      );
+    }
+    if (stopReason === 'max_tokens') {
+      this.cfg.logger?.warn('Peer response truncated at max_tokens', {
+        source: this.cfg.sourceName,
+        finishReason,
+        snippet: text.slice(0, 300),
+      });
+    }
     const usage = parsed.data.usage;
     const inputTokens = usage?.input_tokens ?? 0;
     const outputTokens = usage?.output_tokens ?? 0;
@@ -125,7 +151,7 @@ export class AnthropicCompatAdapter implements IPeerClient {
       text,
       model: this.cfg.model,
       source: this.cfg.sourceName,
-      finishReason: parsed.data.stop_reason ?? 'unknown',
+      finishReason,
       usage: {
         promptTokens: inputTokens,
         completionTokens: outputTokens,
