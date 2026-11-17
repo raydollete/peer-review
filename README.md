@@ -50,8 +50,8 @@ Create a config file (default path `./peer-review.config.json`):
   "thresholds": { "tier1": 2, "tier2": 4 },          // weight targets — see "How tiers, weights, and thresholds interact"
   "arbiter": "gpt-large",                             // source name used for consensus evaluation
   "sources": [
-    { "name": "gpt-large", "apiType": "openai",    "baseUrl": "https://api.openai.com/v1",  "model": "gpt-5.2", "apiKeyEnv": "OPENAI_API_KEY",  "weight": 2, "tier": 1 },
-    { "name": "claude",    "apiType": "anthropic", "baseUrl": "https://api.anthropic.com",  "model": "claude-fable-5", "apiKeyEnv": "ANTHROPIC_API_KEY", "weight": 2, "tier": 2 }
+    { "name": "gpt-large", "apiType": "openai",    "baseUrl": "https://api.openai.com/v1",  "model": "gpt-5.2", "apiKeyEnv": "OPENAI_API_KEY",  "weight": 2, "tier": 1, "timeoutMs": 60000 },
+    { "name": "claude",    "apiType": "anthropic", "baseUrl": "https://api.anthropic.com",  "model": "claude-fable-5", "apiKeyEnv": "ANTHROPIC_API_KEY", "weight": 2, "tier": 2, "timeoutMs": 120000 }
   ]
 }
 ```
@@ -125,6 +125,8 @@ Execution order for one call:
 4. Otherwise the next tier fans out and the arbiter re-rates over **all** accumulated responses — earlier answers are never discarded.
 5. Tiers that were never reached do not appear in `quorum.sources[]` at all.
 
+**The time budget (the reserve model).** `sources[].timeoutMs` is a per-request ceiling, and the run budgets the tiers that escalation walks in two stages. **Startup hard-checks the first tier only:** its wave (its slowest source's effective timeout — an unset `timeoutMs` means the `PEER_TIMEOUT_MS` default, 120 000 ms) plus one arbiter evaluation must fit strictly inside `PEER_REVIEW_DEADLINE_MS`, so a first verdict is always reachable. **Later tiers reserve at entry:** when escalation reaches a tier, the run reserves one arbiter evaluation and clamps that tier's wave to the remaining budget (the smaller of the tier's configured timeout and what the reserve leaves). A tier that cannot start is not billed and not faked as down: it is itemized as `skipped` with 'Skipped: no time left before the deadline after the arbiter reserve'. The global deadline (the wall) is the backstop that bounds the whole call. The practical rule for the tiers escalation walks: the earlier tiers' slowest timeouts plus one arbiter evaluation each must leave the escalated tier time to launch — budget them against `PEER_REVIEW_DEADLINE_MS` and recompute whenever you change it (the shipped `peer-review.config.example.json` budgets 60 s + 60 s before a tier-2 entry under the 280 s default). A higher tier's own `timeoutMs` may exceed the remaining budget — that value is also its `query_peer`/preflight ceiling, and the quorum path clamps the wave at run time.
+
 Sizing guidance:
 
 - **Overprovision each tier.** A tier whose potential weight exactly equals the threshold escalates the moment any one source fails or dissents. Three weight-1 sources against a threshold of 2 tolerate one outlier; two sources tolerate none.
@@ -145,10 +147,10 @@ The walkthroughs below all use this config — two cheap flash-class voters in t
   "thresholds": { "tier1": 2, "tier2": 3, "tier3": 4 },
   "arbiter": "gpt-mini",
   "sources": [
-    { "name": "gemini-flash", "apiType": "openai",    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-3-flash-preview", "apiKeyEnv": "GEMINI_API_KEY",    "weight": 1, "tier": 1 },
-    { "name": "gpt-mini",     "apiType": "openai",    "baseUrl": "https://api.openai.com/v1",                               "model": "gpt-5-mini",             "apiKeyEnv": "OPENAI_API_KEY",    "weight": 1, "tier": 1 },
-    { "name": "gemini-pro",   "apiType": "openai",    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-3-pro",           "apiKeyEnv": "GEMINI_API_KEY",    "weight": 2, "tier": 2 },
-    { "name": "claude",       "apiType": "anthropic", "baseUrl": "https://api.anthropic.com",                               "model": "claude-fable-5",         "apiKeyEnv": "ANTHROPIC_API_KEY", "weight": 2, "tier": 3 }
+    { "name": "gemini-flash", "apiType": "openai",    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-3-flash-preview", "apiKeyEnv": "GEMINI_API_KEY",    "weight": 1, "tier": 1, "timeoutMs": 45000 },
+    { "name": "gpt-mini",     "apiType": "openai",    "baseUrl": "https://api.openai.com/v1",                               "model": "gpt-5-mini",             "apiKeyEnv": "OPENAI_API_KEY",    "weight": 1, "tier": 1, "timeoutMs": 45000 },
+    { "name": "gemini-pro",   "apiType": "openai",    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-3-pro",           "apiKeyEnv": "GEMINI_API_KEY",    "weight": 2, "tier": 2, "timeoutMs": 60000 },
+    { "name": "claude",       "apiType": "anthropic", "baseUrl": "https://api.anthropic.com",                               "model": "claude-fable-5",         "apiKeyEnv": "ANTHROPIC_API_KEY", "weight": 2, "tier": 3, "timeoutMs": 120000 }
   ]
 }
 ```

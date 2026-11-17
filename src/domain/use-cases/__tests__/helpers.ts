@@ -24,7 +24,7 @@ export function peerResponse(source: string, text: string): PeerResponse {
  * to translate a name-keyed rating into the `D<n>` id the real arbiter sees. */
 const answerLog: Array<{ readonly name: string; readonly text: string }> = [];
 
-const DOCUMENT_BLOCK = /<<<DOCUMENT (\d+) id="(D\d+)">>>\n([\s\S]*?)\n<<<END DOCUMENT \1>>>/g;
+const DOCUMENT_BLOCK = /<<<DOCUMENT (\d+) id="(D\d+)" token="[^"]+">>>\n([\s\S]*?)\n<<<END DOCUMENT \1 token="[^"]+">>>/g;
 
 /**
  * The `D<n>` id → source name map for one arbiter prompt. Documents are fenced in

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { ok, err, type Result } from 'neverthrow';
 import { z } from 'zod';
 import type { PeerResponse, TokenUsage } from '../entities/index.js';
@@ -7,7 +8,7 @@ import type { ILogger } from '../../shared/logger/index.js';
 import { sanitizeModelText, stripCodeFences } from '../../shared/text/index.js';
 import {
   ARBITER_SYSTEM_PROMPT,
-  CALLER_RULES_SUFFIX,
+  callerRulesSuffix,
   CALLER_SOURCE_NAME,
   buildArbiterPrompt,
   documentId,
@@ -223,15 +224,6 @@ function warnMalformed(params: EvaluateAgreementParams, attempt: number, reply: 
 export async function evaluateAgreement(
   params: EvaluateAgreementParams,
 ): Promise<Result<AgreementEvaluation, DomainError>> {
-  const basePrompt = buildArbiterPrompt(
-    params.question,
-    params.responses.map((response) => response.text),
-    params.callerAnswer,
-  );
-  const systemInstruction =
-    params.callerAnswer === undefined
-      ? ARBITER_SYSTEM_PROMPT
-      : ARBITER_SYSTEM_PROMPT + CALLER_RULES_SUFFIX;
   const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let reask = REASK_SUFFIX;
   // A valid reply that left ids unrated: the re-ask may only improve on it, so a
@@ -239,8 +231,21 @@ export async function evaluateAgreement(
   let incomplete: z.infer<typeof EvaluationSchema> | undefined;
 
   for (const attempt of [0, 1]) {
+    // Per-attempt unguessable fence token (OWASP LLM01): prompt and system rules
+    // are built from this one tag, and each re-ask is a fresh stateless call.
+    const fenceTag = randomBytes(16).toString('hex');
+    const prompt = buildArbiterPrompt(
+      params.question,
+      params.responses.map((response) => response.text),
+      params.callerAnswer,
+      fenceTag,
+    );
+    const systemInstruction =
+      params.callerAnswer === undefined
+        ? ARBITER_SYSTEM_PROMPT
+        : ARBITER_SYSTEM_PROMPT + callerRulesSuffix(fenceTag);
     const result = await params.arbiter.client.complete({
-      prompt: attempt === 0 ? basePrompt : basePrompt + reask,
+      prompt: attempt === 0 ? prompt : prompt + reask,
       systemInstruction,
       temperature: 0,
       signal: params.signal,

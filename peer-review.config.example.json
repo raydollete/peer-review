@@ -10,7 +10,7 @@
       "apiKeyEnv": "GEMINI_API_KEY",
       "weight": 1,
       "tier": 1,
-      "timeoutMs": 120000,
+      "timeoutMs": 60000,
       "jsonMode": true
     },
     {
@@ -21,7 +21,7 @@
       "apiKeyEnv": "OPENROUTER_API_KEY",
       "weight": 1,
       "tier": 1,
-      "timeoutMs": 120000
+      "timeoutMs": 60000
     },
     {
       "name": "kimi-k3",

@@ -256,6 +256,38 @@ describe('timeout-vs-deadline startup guard', () => {
       ),
     ).not.toThrow();
   });
+
+  it('keeps the example able to reach every escalation tier under the reserve model', async () => {
+    const { loadPeerConfig, loadEnvConfig } = await import('../index.js');
+    const { computeTierBudget, MIN_TIER_BUDGET_MS } = await import('../../domain/use-cases/tier-budget.js');
+    const config = loadPeerConfig('./peer-review.config.example.json');
+    const env = loadEnvConfig({});
+    // Replicate the runtime semantics (src/app.ts:60-67): effective timeout is
+    // the per-source timeoutMs, else PEER_TIMEOUT_MS (120000 default); each
+    // tier's wave takes its slowest member, the arbiter row folded into its tier.
+    const effective = (timeoutMs: number | undefined): number => timeoutMs ?? env.timeoutMs;
+    const tierTimeouts = config.sources.reduce<Record<number, number>>((m, s) => {
+      m[s.tier] = Math.max(m[s.tier] ?? 0, effective(s.timeoutMs));
+      return m;
+    }, {});
+    const arbiterTimeout = effective(config.sources.find((s) => s.name === config.arbiter)?.timeoutMs);
+    const tiers = [...new Set(config.sources.map((s) => s.tier))].sort((a, b) => a - b);
+    // Worst case at each later tier's entry: every earlier tier's wave ran its
+    // slowest source to its timeout, then one arbiter evaluation completed.
+    let elapsed = 0;
+    for (const tier of tiers.slice(1)) {
+      elapsed += tierTimeouts[tiers[tiers.indexOf(tier) - 1]!]! + arbiterTimeout;
+      const remainingBudget = computeTierBudget(env.deadlineMs, elapsed, 1, arbiterTimeout);
+      expect(remainingBudget).toBeGreaterThan(MIN_TIER_BUDGET_MS); // not skipped at entry
+      const wave = Math.min(tierTimeouts[tier]!, remainingBudget);
+      expect(wave).toBeGreaterThan(MIN_TIER_BUDGET_MS); // the wave is awaited, not starved
+    }
+    // The slow reasoner keeps its query-peer/preflight ceiling — the quorum
+    // path clamps it to the remaining budget (peer-review-quorum.use-case.ts:176-178).
+    const kimi = config.sources.find((s) => s.name === 'kimi-k3')!;
+    expect(kimi.timeoutMs).toBe(300000);
+    expect(kimi.maxOutputTokens).toBe(32768);
+  });
 });
 
 describe('declared caller ceiling (task 8)', () => {
