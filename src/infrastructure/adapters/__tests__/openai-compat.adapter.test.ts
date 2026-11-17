@@ -1,7 +1,13 @@
 import { jest } from '@jest/globals';
 import { OpenAiCompatAdapter, type OpenAiCompatAdapterConfig } from '../openai-compat.adapter.js';
 import { ExternalServiceError } from '../../../shared/errors/index.js';
-import { PeerApiError, PeerRateLimitError } from '../../../domain/errors/index.js';
+import {
+  causeOf,
+  EmptyPeerAnswerError,
+  PeerApiError,
+  PeerRateLimitError,
+  TruncatedPeerAnswerError,
+} from '../../../domain/errors/index.js';
 import { StubCredentialProvider, jsonResponse, instantDeps } from './test-helpers.js';
 
 const successFixture = {
@@ -228,7 +234,7 @@ describe('OpenAiCompatAdapter', () => {
     expect(warn.mock.calls[0]![1]).toHaveProperty('snippet');
   });
 
-  it('keeps a truncated but non-empty reply and warns', async () => {
+  it('fails a truncated reply that still carries text, naming the ceiling', async () => {
     const warn = jest.fn();
     const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
       jsonResponse(
@@ -236,10 +242,32 @@ describe('OpenAiCompatAdapter', () => {
       ),
     );
     const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
-    const response = result._unsafeUnwrap();
-    expect(response.text).toBe('Partial answer that got cut');
-    expect(response.finishReason).toBe('length');
+    const error = result._unsafeUnwrapErr();
+    // A half-written answer carries no quorum weight; the snippet stays in the warn.
+    expect(error).toBeInstanceOf(TruncatedPeerAnswerError);
+    expect(error.message).toContain('finish_reason=length');
+    expect(causeOf(error)).toBe('peer_truncated');
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toMatchObject({ finishReason: 'length' });
+  });
+
+  it('fails a textless answer with the bad-response cause', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(completionFixture({ role: 'assistant', content: '' })),
+    );
+    const result = await makeAdapter(fetchMock, { warn: jest.fn() }).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(EmptyPeerAnswerError);
+    expect(error.message).toContain('finish_reason=stop');
+    expect(causeOf(error)).toBe('peer_bad_response');
+  });
+
+  it('keeps a terse, cleanly finished answer', async () => {
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(completionFixture({ role: 'assistant', content: 'Yes.' }, 'stop')),
+    );
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Yes.');
   });
 
   it('countTokens estimates ceil(chars/4) and labels the method', async () => {

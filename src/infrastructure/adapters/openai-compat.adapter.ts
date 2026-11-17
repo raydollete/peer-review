@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { IPeerClient } from '../../domain/ports/index.js';
 import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
+import { EmptyPeerAnswerError, TruncatedPeerAnswerError } from '../../domain/errors/index.js';
 import type { ILogger } from '../../shared/logger/index.js';
 import { sanitizeModelText } from '../../shared/text/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
@@ -126,19 +127,34 @@ export class OpenAiCompatAdapter implements IPeerClient {
     }
     const usage = parsed.data.usage;
     const finishReason = choice.finish_reason ?? 'unknown';
-    const text = this.extractText(choice.message, finishReason);
-    if (text.isErr()) {
-      return err(text.error);
-    }
+    const completionTokens = usage?.completion_tokens ?? 0;
+    const extracted = this.extractText(choice.message, finishReason, completionTokens);
     if (finishReason === 'length') {
-      this.cfg.logger?.warn('Peer response truncated at max_tokens', {
-        source: this.cfg.sourceName,
-        finishReason,
-        snippet: text.value.slice(0, 300),
-      });
+      // The provider stopped the reply at its own output ceiling: a half-written
+      // answer carries no quorum weight, with or without text. The warn fires
+      // once — extractText already warned when there was no text to show.
+      if (extracted.isOk()) {
+        this.cfg.logger?.warn('Peer response truncated at max_tokens', {
+          source: this.cfg.sourceName,
+          finishReason,
+          snippet: extracted.value.slice(0, 300),
+        });
+      }
+      return err(
+        new TruncatedPeerAnswerError(
+          `Peer stopped at max_tokens (finish_reason=${finishReason}, completion=${completionTokens})`,
+          this.cfg.sourceName,
+          finishReason,
+          completionTokens,
+        ),
+      );
     }
+    if (extracted.isErr()) {
+      return err(extracted.error);
+    }
+    const text = extracted.value;
     return ok({
-      text: text.value,
+      text,
       model: this.cfg.model,
       source: this.cfg.sourceName,
       finishReason,
@@ -155,6 +171,7 @@ export class OpenAiCompatAdapter implements IPeerClient {
   private extractText(
     message: CompletionMessage,
     finishReason: string,
+    completionTokens: number,
   ): Result<string, DomainError> {
     let text = sanitizeModelText(message.content ?? '');
     if (text === '') {
@@ -169,9 +186,11 @@ export class OpenAiCompatAdapter implements IPeerClient {
       snippet: (message.content ?? message.reasoning_content ?? '').slice(0, 300),
     });
     return err(
-      new ExternalServiceError(
-        `Peer returned no usable text (finish_reason=${finishReason})`,
+      new EmptyPeerAnswerError(
+        `Peer returned no usable text (finish_reason=${finishReason}, completion=${completionTokens})`,
         this.cfg.sourceName,
+        finishReason,
+        completionTokens,
       ),
     );
   }

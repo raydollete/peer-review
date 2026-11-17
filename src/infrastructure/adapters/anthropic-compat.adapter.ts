@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { IPeerClient } from '../../domain/ports/index.js';
 import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
+import { EmptyPeerAnswerError, TruncatedPeerAnswerError } from '../../domain/errors/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 import { postJson, type HttpDeps } from './http.js';
 
@@ -121,11 +122,36 @@ export class AnthropicCompatAdapter implements IPeerClient {
     const usage = parsed.data.usage;
     const inputTokens = usage?.input_tokens ?? 0;
     const outputTokens = usage?.output_tokens ?? 0;
+    const stopReason = parsed.data.stop_reason ?? 'unknown';
+    // Hidden reasoning is billed against max_tokens: a reply stopped at its own
+    // ceiling carries no vote with or without text, and one with no answer text
+    // never did. Emptiness is exact trim — never a threshold, never
+    // sanitizeModelText, which this wire format never applied to the answer.
+    if (stopReason === 'max_tokens') {
+      return err(
+        new TruncatedPeerAnswerError(
+          `Peer stopped at max_tokens (stop_reason=${stopReason}, completion=${outputTokens})`,
+          this.cfg.sourceName,
+          stopReason,
+          outputTokens,
+        ),
+      );
+    }
+    if (text.trim() === '') {
+      return err(
+        new EmptyPeerAnswerError(
+          `Peer returned no usable text (stop_reason=${stopReason}, completion=${outputTokens})`,
+          this.cfg.sourceName,
+          stopReason,
+          outputTokens,
+        ),
+      );
+    }
     return ok({
       text,
       model: this.cfg.model,
       source: this.cfg.sourceName,
-      finishReason: parsed.data.stop_reason ?? 'unknown',
+      finishReason: stopReason,
       usage: {
         promptTokens: inputTokens,
         completionTokens: outputTokens,

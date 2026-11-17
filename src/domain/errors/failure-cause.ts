@@ -9,11 +9,13 @@ import {
   ArbiterMalformedError,
   CancellationError,
   CredentialError,
+  EmptyPeerAnswerError,
   MalformedResponseBodyError,
   PeerApiError,
   PeerRateLimitError,
   QuorumFailureError,
   TierBudgetElapsedError,
+  TruncatedPeerAnswerError,
   TransportError,
 } from './peer-errors.js';
 
@@ -34,6 +36,10 @@ export type PeerReviewFailureCause =
   | 'credential'
   | 'rate_limited'
   | 'peer_bad_response'
+  /** The provider stopped the reply at its own output ceiling (`max_tokens` /
+   * `length`), or produced no answer text at all inside it. The repair is the
+   * source's output budget, not its model name or endpoint. */
+  | 'peer_truncated'
   | 'arbiter_unavailable'
   | 'arbiter_malformed'
   | 'deadline'
@@ -50,6 +56,15 @@ export type PeerReviewFailureCause =
 export function causeOf(error: DomainError): PeerReviewFailureCause {
   if (error instanceof QuorumFailureError) {
     return error.cause;
+  }
+  // Unusable provider answers are classified by subclass, never by message
+  // text. Both sit above every other ExternalServiceError branch so a future
+  // subclass of one of them cannot be swallowed by the catch-all below.
+  if (error instanceof TruncatedPeerAnswerError) {
+    return 'peer_truncated';
+  }
+  if (error instanceof EmptyPeerAnswerError) {
+    return 'peer_bad_response';
   }
   if (error instanceof ValidationError) {
     return 'validation';
@@ -101,6 +116,8 @@ const CAUSE_FIXES: Record<PeerReviewFailureCause, string> = {
   rate_limited: 'Wait before retrying, or lower the weight/tier of this source in peer-review.config.json',
   arbiter_malformed:
     'Set jsonMode for the arbiter source or choose a JSON-reliable arbiter in peer-review.config.json',
+  peer_truncated:
+    'Raise maxOutputTokens for the named source (peer-review.config.json, or the peer policy in the app) — hidden reasoning is billed against max_tokens, so the output budget must exceed the model\'s thinking length; raise timeoutMs with it',
   arbiter_unavailable:
     'Check the arbiter source reachability and credentials in peer-review.config.json',
   deadline:

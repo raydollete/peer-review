@@ -12,7 +12,7 @@ import {
   CountTokensUseCase,
 } from '../../../domain/use-cases/index.js';
 import type { PeerSource } from '../../../domain/entities/index.js';
-import { CredentialError, TransportError } from '../../../domain/errors/index.js';
+import { CredentialError, TransportError, TruncatedPeerAnswerError } from '../../../domain/errors/index.js';
 import {
   makeSource as makeSourceWith,
   makeSource,
@@ -276,6 +276,37 @@ describe('failure envelope forwarding (tasks 4, 5, 14)', () => {
     expect(result.error?.cause).toBe('peer_unreachable');
     expect(result.error?.source).toBe('refused');
     expect(result.error?.detail).toContain('ECONNREFUSED');
+  });
+
+  it('query_peer names the output ceiling instead of being masked by the caller ceiling', async () => {
+    const base = makeSource('claude', 1, 1, answers('claude', 'unused'));
+    const claude: PeerSource = {
+      ...base,
+      client: {
+        ...base.client,
+        complete: async () =>
+          err(
+            new TruncatedPeerAnswerError(
+              'Peer stopped at max_tokens (finish_reason=max_tokens, completion=8192)',
+              'claude',
+              'max_tokens',
+              8192,
+            ),
+          ),
+      },
+    };
+    const controller = new QueryPeerController(new QueryPeerUseCase([claude], 5_000_000, 300_000), {
+      deadlineMs: 280000,
+      callerTimeoutMs: 30000,
+      cause: 'configuration',
+      fix: 'lower the deadline, or raise the tool-call timeout in the harness registration',
+    });
+    const result = await controller.handle({ source: 'claude', prompt: 'ping' });
+    expect(result.success).toBe(false);
+    // A specific cause survives the ceiling mismatch; only 'internal' is masked.
+    expect(result.error?.cause).toBe('peer_truncated');
+    expect(result.error?.fix).toContain('maxOutputTokens');
+    expect(result.error?.source).toBe('claude');
   });
 
   it('query_peer is bounded by the smaller of deadline and declared ceiling (task 14)', async () => {

@@ -1,6 +1,6 @@
 import { jest } from '@jest/globals';
 import { AnthropicCompatAdapter } from '../anthropic-compat.adapter.js';
-import { PeerRateLimitError } from '../../../domain/errors/index.js';
+import { causeOf, PeerRateLimitError, TruncatedPeerAnswerError, EmptyPeerAnswerError } from '../../../domain/errors/index.js';
 import { StubCredentialProvider, jsonResponse, instantDeps } from './test-helpers.js';
 
 const successFixture = {
@@ -97,5 +97,64 @@ describe('AnthropicCompatAdapter', () => {
     const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
     const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
     expect(result._unsafeUnwrap().text).toBe('Part one. Part two.');
+  });
+
+  it('fails the thinking-only max_tokens body a reasoning model returns', async () => {
+    // Shape captured live 2026-11-16 from POST /v1/messages at max_tokens 8192:
+    // content held only a thinking block and the whole budget was billed to it.
+    const fixture = {
+      ...successFixture,
+      content: [{ type: 'thinking', thinking: 'deliberating over every requirement…' }],
+      stop_reason: 'max_tokens',
+      usage: { input_tokens: 1450, output_tokens: 8192 },
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'review this change' });
+    const error = result._unsafeUnwrapErr();
+    // An empty answer must never reach the quorum as an ok vote with agreement 0.
+    expect(error).toBeInstanceOf(TruncatedPeerAnswerError);
+    expect(error.message).toContain('stop_reason=max_tokens');
+    expect(error.message).toContain('completion=8192');
+    expect(causeOf(error)).toBe('peer_truncated');
+  });
+
+  it('fails a truncated answer that did emit text', async () => {
+    const fixture = {
+      ...successFixture,
+      content: [{ type: 'text', text: 'Half an answer tha' }],
+      stop_reason: 'max_tokens',
+      usage: { input_tokens: 20, output_tokens: 2048 },
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrapErr()).toBeInstanceOf(TruncatedPeerAnswerError);
+    expect(causeOf(result._unsafeUnwrapErr())).toBe('peer_truncated');
+  });
+
+  it('fails a refusal with no output', async () => {
+    const fixture = {
+      ...successFixture,
+      content: [],
+      stop_reason: 'refusal',
+      usage: { input_tokens: 1450, output_tokens: 0 },
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    expect(error).toBeInstanceOf(EmptyPeerAnswerError);
+    expect(error.message).toContain('stop_reason=refusal');
+    expect(causeOf(error)).toBe('peer_bad_response');
+  });
+
+  it('accepts a terse answer that finished cleanly', async () => {
+    const fixture = {
+      ...successFixture,
+      content: [{ type: 'text', text: 'Yes.' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 12, output_tokens: 3 },
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    expect(result._unsafeUnwrap().text).toBe('Yes.');
   });
 });

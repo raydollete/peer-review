@@ -1,5 +1,11 @@
 import { AGREEMENT_THRESHOLD, evaluateAgreement } from './agreement.js';
-import { ArbiterMalformedError, TimeoutError, type DomainError } from '../errors/index.js';
+import {
+  ArbiterMalformedError,
+  EmptyPeerAnswerError,
+  TimeoutError,
+  TruncatedPeerAnswerError,
+  type DomainError,
+} from '../errors/index.js';
 import type { ArbiterErrorRecord } from '../entities/index.js';
 import { isRunCancellation } from './source-reports.js';
 import type { QuorumDeps, QuorumInput, RunState } from './peer-review-quorum.use-case.js';
@@ -70,6 +76,24 @@ export async function evaluateRun(
  * class distinguishes a malformed reply from an unavailable arbiter; the
  * detail is a fixed line, never the model's own text. */
 function arbiterErrorRecord(name: string, error: DomainError): ArbiterErrorRecord {
+  // The arbiter is a peer source too, so it can hit the same output ceiling.
+  // Its failure must name that repair, not "check reachability and credentials".
+  if (error instanceof TruncatedPeerAnswerError) {
+    return {
+      code: error.code,
+      cause: 'peer_truncated',
+      source: name,
+      detail: `arbiter "${name}" stopped at its output ceiling (stop_reason=${error.stopReason}, completion=${error.completionTokens})`,
+    };
+  }
+  if (error instanceof EmptyPeerAnswerError) {
+    return {
+      code: error.code,
+      cause: 'arbiter_malformed',
+      source: name,
+      detail: `arbiter "${name}" returned no usable text (stop_reason=${error.stopReason}, completion=${error.completionTokens})`,
+    };
+  }
   if (error instanceof ArbiterMalformedError) {
     return {
       code: error.code,

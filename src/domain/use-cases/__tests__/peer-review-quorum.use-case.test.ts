@@ -2,6 +2,8 @@ import { ok, err, type Result } from 'neverthrow';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
 import {
   CancellationError,
+  EmptyPeerAnswerError,
+  TruncatedPeerAnswerError,
   CredentialError,
   PeerRateLimitError,
   QuorumFailureError,
@@ -1049,6 +1051,85 @@ describe('PeerReviewQuorumUseCase: failure contract (tasks 3, 4, 15)', () => {
     expect(error.context?.arbiter).toBeUndefined();
     expect(error.context?.sources).toHaveLength(1);
     expect(error.context?.sources[0]?.cause).toBe('peer_unreachable');
+  });
+
+  it('names the output ceiling when the arbiter is truncated by its own budget', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const arbiter = makeSource('arbiter', 1, 1, async () =>
+      err(
+        new TruncatedPeerAnswerError(
+          'Peer stopped at max_tokens (finish_reason=length, completion=8192)',
+          'arbiter',
+          'length',
+          8192,
+        ),
+      ),
+    );
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    // The repair is the output budget, not "check reachability and credentials".
+    expect(result.arbiterFailed).toBe(true);
+    expect(result.arbiter?.error.cause).toBe('peer_truncated');
+    expect(result.arbiter?.error.detail).toContain('stop_reason=length');
+    expect(result.arbiter?.error.detail).toContain('completion=8192');
+    // The arbiter's own failure must not blame a healthy peer.
+    expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
+  });
+
+  it('reports a textless arbiter reply as a malformed reply, not an outage', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const arbiter = makeSource('arbiter', 1, 1, async () =>
+      err(
+        new EmptyPeerAnswerError(
+          'Peer returned no usable text (stop_reason=refusal, completion=0)',
+          'arbiter',
+          'refusal',
+          0,
+        ),
+      ),
+    );
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a],
+      arbiter,
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
+    expect(result.arbiterFailed).toBe(true);
+    expect(result.arbiter?.error.cause).toBe('arbiter_malformed');
+    expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
+  });
+
+  it('keeps the roster and the billed tokens when every consulted source is truncated', async () => {
+    const claude = makeSource('claude', 1, 2, async () =>
+      err(
+        new TruncatedPeerAnswerError(
+          'Peer stopped at max_tokens (stop_reason=max_tokens, completion=8192)',
+          'claude',
+          'max_tokens',
+          8192,
+        ),
+      ),
+    );
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [claude],
+      arbiter: makeArbiter([{ claude: 0.9 }]),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+    });
+    const failure = (await useCase.execute({ prompt }))._unsafeUnwrapErr() as QuorumFailureError;
+    expect(failure).toBeInstanceOf(QuorumFailureError);
+    // The no-success response stays as diagnosable as the success one: the roster
+    // rides the failure, and the burn the source billed is named on its own row.
+    expect(failure.cause).toBe('peer_truncated');
+    expect(failure.context?.sources).toHaveLength(1);
+    expect(failure.context?.sources[0]?.cause).toBe('peer_truncated');
+    expect(failure.context?.sources[0]?.error).toContain('completion=8192');
   });
 
   it('names the three total-outage shapes apart with distinct causes (task 4)', async () => {

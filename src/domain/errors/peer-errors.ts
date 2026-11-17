@@ -76,6 +76,37 @@ export class MalformedResponseBodyError extends ExternalServiceError {
   }
 }
 
+/** A provider reply that cannot be used as a vote: no answer text at all (a
+ * thinking-only `max_tokens` body, a `refusal`, an empty completion). The
+ * provider's stop signal and the completion tokens it billed are typed fields,
+ * so the roster names the burn without re-deriving it from message text. Maps
+ * to `'peer_bad_response'`. */
+export class EmptyPeerAnswerError extends ExternalServiceError {
+  constructor(
+    override readonly message: string,
+    service: string,
+    readonly stopReason: string,
+    readonly completionTokens: number,
+  ) {
+    super(message, service);
+  }
+}
+
+/** A provider reply the model stopped at its own output ceiling (Anthropic
+ * `max_tokens`, OpenAI `length`). Whether or not text came out, a half-written
+ * answer must not carry quorum weight. Maps to `'peer_truncated'`, whose
+ * operator fix is the source's output budget. */
+export class TruncatedPeerAnswerError extends ExternalServiceError {
+  constructor(
+    override readonly message: string,
+    service: string,
+    readonly stopReason: string,
+    readonly completionTokens: number,
+  ) {
+    super(message, service);
+  }
+}
+
 /** The arbiter answered in prose so extraction failed after the one re-ask.
  * Maps to `'arbiter_malformed'`; any other arbiter error is `'arbiter_unavailable'`. */
 export class ArbiterMalformedError extends ExternalServiceError {

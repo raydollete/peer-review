@@ -6,6 +6,8 @@ export {
   CancellationError,
   TierBudgetElapsedError,
   MalformedResponseBodyError,
+  EmptyPeerAnswerError,
+  TruncatedPeerAnswerError,
   ArbiterMalformedError,
   QuorumFailureError,
 } from './peer-errors.js';
