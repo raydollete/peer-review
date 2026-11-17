@@ -4,6 +4,8 @@ import type { IPeerClient } from '../../domain/ports/index.js';
 import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
 import { EmptyPeerAnswerError, TruncatedPeerAnswerError } from '../../domain/errors/index.js';
+import type { ILogger } from '../../shared/logger/index.js';
+import { sanitizeModelText } from '../../shared/text/index.js';
 import type { ICredentialProvider } from './credential-provider.js';
 import { postJson, type HttpDeps } from './http.js';
 
@@ -24,6 +26,7 @@ export interface AnthropicCompatAdapterConfig {
   readonly timeoutMs: number;
   readonly maxOutputTokens: number;
   readonly credentialProvider: ICredentialProvider;
+  readonly logger?: Pick<ILogger, 'warn'>;
 }
 
 type WireMessage = { role: 'user' | 'assistant'; content: string };
@@ -119,44 +122,62 @@ export class AnthropicCompatAdapter implements IPeerClient {
       .filter((block) => block.type === 'text')
       .map((block) => block.text ?? '')
       .join('');
+    const finishReason = parsed.data.stop_reason ?? 'unknown';
     const usage = parsed.data.usage;
     const inputTokens = usage?.input_tokens ?? 0;
     const outputTokens = usage?.output_tokens ?? 0;
-    const stopReason = parsed.data.stop_reason ?? 'unknown';
-    // Hidden reasoning is billed against max_tokens: a reply stopped at its own
-    // ceiling carries no vote with or without text, and one with no answer text
-    // never did. Emptiness is exact trim — never a threshold, never
-    // sanitizeModelText, which this wire format never applied to the answer.
-    if (stopReason === 'max_tokens') {
-      return err(
-        new TruncatedPeerAnswerError(
-          `Peer stopped at max_tokens (stop_reason=${stopReason}, completion=${outputTokens})`,
-          this.cfg.sourceName,
-          stopReason,
-          outputTokens,
-        ),
-      );
-    }
-    if (text.trim() === '') {
-      return err(
-        new EmptyPeerAnswerError(
-          `Peer returned no usable text (stop_reason=${stopReason}, completion=${outputTokens})`,
-          this.cfg.sourceName,
-          stopReason,
-          outputTokens,
-        ),
-      );
+    const unusable = this.unusableAnswer(text, finishReason, outputTokens);
+    if (unusable !== undefined) {
+      return err(unusable);
     }
     return ok({
       text,
       model: this.cfg.model,
       source: this.cfg.sourceName,
-      finishReason: stopReason,
+      finishReason,
       usage: {
         promptTokens: inputTokens,
         completionTokens: outputTokens,
         totalTokens: inputTokens + outputTokens,
       },
     });
+  }
+
+  /** A reply that cannot carry a vote: stopped at the output ceiling, or no answer
+   * text at all. The stop signal is checked first because hidden reasoning is
+   * billed against max_tokens and that repair is the source's output budget.
+   * Text is sanitized only to decide emptiness; the reply itself is returned as-is. */
+  private unusableAnswer(
+    text: string,
+    finishReason: string,
+    completionTokens: number,
+  ): DomainError | undefined {
+    if (finishReason === 'max_tokens') {
+      this.cfg.logger?.warn('Peer response truncated at max_tokens', {
+        source: this.cfg.sourceName,
+        finishReason,
+        snippet: text.slice(0, 300),
+      });
+      return new TruncatedPeerAnswerError(
+        `Peer stopped at max_tokens (stop_reason=${finishReason}, completion=${completionTokens})`,
+        this.cfg.sourceName,
+        finishReason,
+        completionTokens,
+      );
+    }
+    if (sanitizeModelText(text) === '') {
+      this.cfg.logger?.warn('Peer returned empty text after sanitization', {
+        source: this.cfg.sourceName,
+        finishReason,
+        snippet: text.slice(0, 300),
+      });
+      return new EmptyPeerAnswerError(
+        `Peer returned no usable text (stop_reason=${finishReason}, completion=${completionTokens})`,
+        this.cfg.sourceName,
+        finishReason,
+        completionTokens,
+      );
+    }
+    return undefined;
   }
 }

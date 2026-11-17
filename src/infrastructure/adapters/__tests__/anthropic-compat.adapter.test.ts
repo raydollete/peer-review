@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { AnthropicCompatAdapter } from '../anthropic-compat.adapter.js';
 import { causeOf, PeerRateLimitError, TruncatedPeerAnswerError, EmptyPeerAnswerError } from '../../../domain/errors/index.js';
+import { ExternalServiceError } from '../../../shared/errors/index.js';
 import { StubCredentialProvider, jsonResponse, instantDeps } from './test-helpers.js';
 
 const successFixture = {
@@ -11,7 +12,10 @@ const successFixture = {
   usage: { input_tokens: 15, output_tokens: 5 },
 };
 
-function makeAdapter(fetchFn: typeof fetch): AnthropicCompatAdapter {
+function makeAdapter(
+  fetchFn: typeof fetch,
+  logger?: { warn: (message: string, context?: Record<string, unknown>) => void },
+): AnthropicCompatAdapter {
   return new AnthropicCompatAdapter(
     {
       sourceName: 'claude',
@@ -20,6 +24,7 @@ function makeAdapter(fetchFn: typeof fetch): AnthropicCompatAdapter {
       timeoutMs: 5000,
       maxOutputTokens: 2048,
       credentialProvider: new StubCredentialProvider('ak-test'),
+      ...(logger !== undefined ? { logger } : {}),
     },
     instantDeps(fetchFn),
   );
@@ -99,6 +104,18 @@ describe('AnthropicCompatAdapter', () => {
     expect(result._unsafeUnwrap().text).toBe('Part one. Part two.');
   });
 
+  it('rejects an empty reply and names the stop_reason', async () => {
+    const fixture = { ...successFixture, content: [], stop_reason: 'max_tokens' };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    // A reply with no text inside the ceiling is the truncation shape: the repair
+    // is the source's output budget, so it names the cause that says so.
+    expect(error).toBeInstanceOf(ExternalServiceError);
+    expect(error.message).toContain('stop_reason=max_tokens');
+    expect(causeOf(error)).toBe('peer_truncated');
+  });
+
   it('fails the thinking-only max_tokens body a reasoning model returns', async () => {
     // Shape captured live 2026-11-16 from POST /v1/messages at max_tokens 8192:
     // content held only a thinking block and the whole budget was billed to it.
@@ -116,19 +133,6 @@ describe('AnthropicCompatAdapter', () => {
     expect(error.message).toContain('stop_reason=max_tokens');
     expect(error.message).toContain('completion=8192');
     expect(causeOf(error)).toBe('peer_truncated');
-  });
-
-  it('fails a truncated answer that did emit text', async () => {
-    const fixture = {
-      ...successFixture,
-      content: [{ type: 'text', text: 'Half an answer tha' }],
-      stop_reason: 'max_tokens',
-      usage: { input_tokens: 20, output_tokens: 2048 },
-    };
-    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
-    const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
-    expect(result._unsafeUnwrapErr()).toBeInstanceOf(TruncatedPeerAnswerError);
-    expect(causeOf(result._unsafeUnwrapErr())).toBe('peer_truncated');
   });
 
   it('fails a refusal with no output', async () => {
@@ -156,5 +160,26 @@ describe('AnthropicCompatAdapter', () => {
     const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
     const result = await makeAdapter(fetchMock).complete({ prompt: 'q' });
     expect(result._unsafeUnwrap().text).toBe('Yes.');
+  });
+
+  it('fails a truncated answer that did emit text and warns once', async () => {
+    const fixture = {
+      ...successFixture,
+      content: [{ type: 'text', text: 'Partial answer' }],
+      stop_reason: 'max_tokens',
+    };
+    const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(fixture));
+    const warn = jest.fn();
+    const result = await makeAdapter(fetchMock, { warn }).complete({ prompt: 'q' });
+    const error = result._unsafeUnwrapErr();
+    // A half-written answer carries no quorum weight; the snippet stays in the warn.
+    expect(error).toBeInstanceOf(TruncatedPeerAnswerError);
+    expect(causeOf(error)).toBe('peer_truncated');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith('Peer response truncated at max_tokens', {
+      source: 'claude',
+      finishReason: 'max_tokens',
+      snippet: 'Partial answer',
+    });
   });
 });

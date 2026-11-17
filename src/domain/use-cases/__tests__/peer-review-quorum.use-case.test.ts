@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals';
 import { ok, err, type Result } from 'neverthrow';
 import { PeerReviewQuorumUseCase } from '../peer-review-quorum.use-case.js';
 import {
@@ -21,6 +22,7 @@ import {
   resolvesOnAbortOnly,
   resolvesAfterDelay,
   slowArbiter,
+  scriptedRatings,
 } from './helpers.js';
 import {
   initialAbortAttribution,
@@ -193,7 +195,11 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(arbiter.calls).toHaveLength(1);
     expect(result.achieved).toBe(false);
     expect(result.tier).toBe(1);
-    expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
+    const aReport = result.sources.find((s) => s.name === 'a');
+    expect(aReport?.status).toBe('ok');
+    // The first evaluation never finished: unrated, and the row says why.
+    expect(aReport?.agreement).toBeNull();
+    expect(aReport?.note).toBe('Unrated: the run ended before the arbiter rated this source');
   });
 
   it('early-aborts pending same-tier calls once quorum weight is met', async () => {
@@ -243,6 +249,7 @@ describe('PeerReviewQuorumUseCase', () => {
     const lateReport = result.sources.find((s) => s.name === 'late');
     expect(lateReport?.status).toBe('ok');
     expect(lateReport?.agreement).toBeNull(); // answered after the rating, so unrated
+    expect(lateReport?.note).toBe('Unrated: the run ended before the arbiter rated this source');
     expect(result.usage.totalTokens).toBe(45); // a + late + arbiter, 15 each
     expect(result.sources.find((s) => s.name === 'never')?.status).toBe('cancelled');
   });
@@ -298,10 +305,10 @@ describe('PeerReviewQuorumUseCase', () => {
     const never = makeSource('never', 1, 1, resolvesOnAbortOnly);
     // First evaluation runs 100–700 ms, past the 500 ms slice; the second is instant.
     let arbiterCall = 0;
-    const arbiter = makeSource('arbiter', 99, 1, () => {
+    const arbiter = makeSource('arbiter', 99, 1, (request) => {
       arbiterCall += 1;
       const ratings = arbiterCall === 1 ? { a: 0.2 } : { a: 0.9, b: 0.9 };
-      const body = Object.entries(ratings).map(([name, agreement]) => ({ name, agreement }));
+      const body = scriptedRatings(request.prompt, ratings);
       const reply = ok(peerResponse('arbiter', JSON.stringify({ consensus: 'CONSENSUS', ratings: body })));
       return arbiterCall === 1
         ? new Promise((resolve) => setTimeout(() => resolve(reply), 600))
@@ -471,8 +478,92 @@ describe('PeerReviewQuorumUseCase', () => {
     // this must not hand back. Metadata stays complete.
     expect(result.response).toBe('');
     expect(result.responseWithheld).toBe(true);
-    // Stale ratings remain itemized for transparency.
+    // Stale ratings remain itemized for transparency, but say they are not the
+    // latest verdict; the tier-2 peer the failed pass never rated says so too.
+    const aReport = result.sources.find((s) => s.name === 'a');
+    expect(aReport?.agreement).toBe(0.9);
+    expect(aReport?.note).toBe(
+      'Rated by an earlier evaluation; the latest arbiter evaluation failed — see quorum.arbiter',
+    );
+    const cReport = result.sources.find((s) => s.name === 'c');
+    expect(cReport?.agreement).toBeNull();
+    expect(cReport?.note).toBe('Unrated: the arbiter failed; see quorum.arbiter');
+  });
+
+  it('reports a source the arbiter never rated as unrated, never as 0', async () => {
+    const warn = jest.fn();
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Lyon'));
+    const arbiter = makeArbiter([{ a: 0.9 }]); // b omitted on both attempts
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+      logger: { warn, debug: jest.fn() },
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(arbiter.calls).toHaveLength(2); // one re-ask naming the missing id
+    const bReport = result.sources.find((s) => s.name === 'b');
+    expect(bReport?.status).toBe('ok');
+    expect(bReport?.agreement).toBeNull();
+    expect(bReport?.note).toBe('Unrated: the arbiter returned no rating for this source');
+    expect(bReport?.reason).toBeUndefined();
+    expect(result.agreeingWeight).toBe(2); // b contributes no weight
+    expect(result.certaintyScore).toBeCloseTo(0.45); // min(1, 2/4) × 0.9 — b not in the mean
+    expect(warn).toHaveBeenCalledWith('Arbiter returned no rating for a source', {
+      source: 'b',
+      arbiter: 'arbiter',
+    });
+  });
+
+  it('explains every rated score on a failed quorum while withholding the prose', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'Paris'));
+    const b = makeSource('b', 1, 2, answers('b', 'Lyon'));
+    const arbiter = makeArbiter([
+      {
+        a: { agreement: 0.9, reason: 'States the consensus.' },
+        b: { agreement: 0.2, reason: 'Names a different city.' },
+      },
+    ]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(result.achieved).toBe(false);
+    expect(result.response).toBe('');
+    expect(result.responseWithheld).toBe(true);
+    expect(result.sources.find((s) => s.name === 'a')?.reason).toBe('States the consensus.');
+    const bReport = result.sources.find((s) => s.name === 'b');
+    expect(bReport?.agreement).toBe(0.2);
+    expect(bReport?.reason).toBe('Names a different city.');
+    expect(bReport?.note).toBeUndefined();
+  });
+
+  it('names a rating by the configured source, not by what the adapter echoed', async () => {
+    // resolvesAfterDelay answers with PeerResponse.source 'slow' for every source.
+    const a = makeSource('a', 1, 2, resolvesAfterDelay(5, 'first'));
+    const b = makeSource('b', 1, 2, resolvesAfterDelay(10, 'second'));
+    const arbiter = makeArbiter([{ D1: 0.9, D2: 0.8 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
     expect(result.sources.find((s) => s.name === 'a')?.agreement).toBe(0.9);
+    expect(result.sources.find((s) => s.name === 'b')?.agreement).toBe(0.8);
+    expect(result.achieved).toBe(true);
   });
 
   it('never sends the caller answer to peers', async () => {
@@ -947,6 +1038,7 @@ describe('PeerReviewQuorumUseCase', () => {
     // The arbiter's first call hangs until aborted (contended); the second is healthy.
     let arbiterCall = 0;
     const arbiterComplete = (request: {
+      prompt: string;
       signal?: AbortSignal | undefined;
     }): Promise<Result<PeerResponse, DomainError>> => {
       const attempt = arbiterCall;
@@ -967,10 +1059,7 @@ describe('PeerReviewQuorumUseCase', () => {
             'arbiter',
             JSON.stringify({
               consensus: 'CONSENSUS',
-              ratings: [
-                { name: 'a', agreement: 1 },
-                { name: 'c', agreement: 1 },
-              ],
+              ratings: scriptedRatings(request.prompt, { a: 1, c: 1 }),
             }),
           ),
         ),
@@ -1241,9 +1330,16 @@ describe('PeerReviewQuorumUseCase: failure contract (tasks 3, 4, 15)', () => {
     const never = makeSource('b', 1, 2, resolvesOnAbortOnly);
     const useCase = new PeerReviewQuorumUseCase({
       sources: [a, never],
-      arbiter: makeArbiter([{ a: 0.9 }]),
-      thresholds: { 1: 5 },
+      // With no evaluation running, this single tier's fallback budget ends at
+      // the same ~60 ms as the wall and whichever fires first marks b (flaked
+      // ~30%). Here a's answer alone makes quorum possible, so an evaluation
+      // starts and outlasts the wall; it rates a below threshold, so nothing
+      // early-aborts b — the wall is the clock that ends b.
+      arbiter: slowArbiter(150, { a: 0.2 }),
+      thresholds: { 1: 2 },
       deadlineMs: 60,
+      tierTimeoutMs: { 1: 30 },
+      arbiterTimeoutMs: 20,
     });
     const result = (await useCase.execute({ prompt }))._unsafeUnwrap();
     const report = result.sources.find((s) => s.name === 'b');

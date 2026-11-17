@@ -241,6 +241,33 @@ describe('failure envelope forwarding (tasks 4, 5, 14)', () => {
     expect(result.error?.fix).toContain('prompt');
   });
 
+  it('a failed quorum explains each rated row and marks the unrated one at the boundary', async () => {
+    const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
+    const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
+    const c = makeSource('c', 1, 1, answers('c', 'answer-c'));
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, b, c],
+      // c is never rated, on either attempt; b is rated without a reason.
+      arbiter: makeArbiter([{ a: { agreement: 0.1, reason: 'Recommends the opposite.' }, b: 0.9 }]),
+      thresholds: { 1: 5 },
+      deadlineMs: 5000,
+    });
+    const result = await new PeerReviewController(useCase).handle({ prompt });
+    expect(result.data?.quorum.achieved).toBe(false);
+    expect(result.data?.response).toBe('');
+    const rows = result.data?.quorum.sources ?? [];
+    expect(rows.find((s) => s.name === 'a')).toMatchObject({ agreement: 0.1, reason: 'Recommends the opposite.' });
+    const bRow = rows.find((s) => s.name === 'b');
+    expect(bRow?.agreement).toBe(0.9);
+    expect(bRow).not.toHaveProperty('reason'); // no reason given → no key, old shape
+    expect(bRow).not.toHaveProperty('note');
+    expect(rows.find((s) => s.name === 'c')).toMatchObject({
+      status: 'ok',
+      agreement: null,
+      note: 'Unrated: the arbiter returned no rating for this source',
+    });
+  });
+
   it('achieved path keeps the pre-change key set at the boundary (task 5)', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'answer-a'));
     const b = makeSource('b', 1, 2, answers('b', 'answer-b'));
