@@ -1,4 +1,5 @@
 import { ok, err } from 'neverthrow';
+import type { PeerResponse } from '../../../domain/entities/index.js';
 import {
   PeerReviewController,
   QueryPeerController,
@@ -18,6 +19,7 @@ import {
   makeSource,
   makeArbiter,
   answers,
+  peerResponse,
   resolvesOnAbortOnly,
 } from '../../../domain/use-cases/__tests__/helpers.js';
 
@@ -137,7 +139,7 @@ describe('QueryPeerController', () => {
       model: 'b-model',
       source: 'b',
       finishReason: 'stop',
-      tokenUsage: { prompt: 10, completion: 5, total: 15 },
+      tokenUsage: { prompt: 10, completion: 5, total: 15, cachedPrompt: 0 },
     });
   });
 
@@ -400,5 +402,57 @@ describe('failure envelope forwarding (tasks 4, 5, 14)', () => {
     const listing = new ListPeersUseCase([a]).execute();
     expect(listing.callerCeiling).toBeUndefined();
     expect('callerCeiling' in listing).toBe(false);
+  });
+});
+
+describe('tokenUsage.cachedPrompt', () => {
+  const usage = (promptTokens: number, cachedPromptTokens: number): PeerResponse['usage'] => ({
+    promptTokens,
+    cachedPromptTokens,
+    completionTokens: 20,
+    totalTokens: promptTokens + 20,
+  });
+  const reply = (source: string, text: string, cached: number): PeerResponse => ({
+    ...peerResponse(source, text),
+    usage: usage(1000, cached),
+  });
+
+  it('reports the cached prompt tokens of a query_peer call', async () => {
+    const source = makeSource('s', 1, 1, async () => ok(reply('s', 'hi', 768)));
+    const result = await new QueryPeerController(new QueryPeerUseCase([source], 5000)).handle({ prompt: 'q', source: 's' });
+    expect(result.data?.tokenUsage).toEqual({ prompt: 1000, completion: 20, total: 1020, cachedPrompt: 768 });
+  });
+
+  it('sums cached prompt tokens across the peers and both arbiter calls of a peer_review run', async () => {
+    const verdict = JSON.stringify({
+      consensus: 'C',
+      ratings: [
+        { id: 'D1', agreement: 0.9 },
+        { id: 'D2', agreement: 0.9 },
+      ],
+    });
+    let arbiterCall = 0;
+    const arbiter = makeSource('arbiter', 99, 1, async () => {
+      arbiterCall += 1;
+      return ok(arbiterCall === 1 ? reply('arbiter', 'not json', 0) : reply('arbiter', verdict, 900));
+    });
+    const quorum = new PeerReviewQuorumUseCase({
+      sources: [
+        makeSource('a', 1, 2, async () => ok(reply('a', 'x', 0))),
+        makeSource('b', 1, 2, async () => ok(reply('b', 'x', 0))),
+      ],
+      arbiter,
+      thresholds: { 1: 4 },
+      deadlineMs: 5000,
+    });
+    const result = await new PeerReviewController(quorum).handle({ prompt: 'q' });
+    expect(arbiterCall).toBe(2);
+    expect(result.data?.tokenUsage.cachedPrompt).toBe(900);
+    expect(result.data?.tokenUsage.prompt).toBe(4000);
+  });
+
+  it('is 0 when no provider reported cache data', async () => {
+    const { peerReview } = buildControllers();
+    expect((await peerReview.handle({ prompt: 'q' })).data?.tokenUsage.cachedPrompt).toBe(0);
   });
 });

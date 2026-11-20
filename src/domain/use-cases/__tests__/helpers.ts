@@ -1,6 +1,6 @@
 import { ok, err, type Result } from 'neverthrow';
 import type { PeerSource, IPeerClient } from '../../ports/index.js';
-import type { PeerRequest, PeerResponse } from '../../entities/index.js';
+import { promptText, type PeerRequest, type PeerResponse } from '../../entities/index.js';
 import { CancellationError, PeerApiError } from '../../errors/index.js';
 import type { DomainError } from '../../../shared/errors/index.js';
 
@@ -16,7 +16,7 @@ export function peerResponse(source: string, text: string): PeerResponse {
     model: `${source}-model`,
     source,
     finishReason: 'stop',
-    usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+    usage: { promptTokens: 10, cachedPromptTokens: 0, completionTokens: 5, totalTokens: 15 },
   };
 }
 
@@ -144,7 +144,7 @@ export function slowArbiter(ms: number, ratings: Record<string, number>): TestSo
   return makeSource('arbiter', 99, 1, (request) =>
     new Promise((resolve) => {
       // Resolve ids at call time: a peer settling during the evaluation is not a document.
-      const body = scriptedRatings(request.prompt, ratings);
+      const body = scriptedRatings(promptText(request.prompt), ratings);
       setTimeout(() => {
         const consensus = { consensus: 'CONSENSUS', ratings: body };
         resolve(ok(peerResponse('arbiter', JSON.stringify(consensus))));
@@ -174,7 +174,7 @@ export function makeArbiter(script: ArbiterScript, consensus = 'CONSENSUS'): Tes
     if (entry === 'garbage' || entry === undefined) {
       return ok(peerResponse('arbiter', 'I refuse to answer in JSON.'));
     }
-    const ratings = scriptedRatings(request.prompt, entry);
+    const ratings = scriptedRatings(promptText(request.prompt), entry);
     return ok(peerResponse('arbiter', JSON.stringify({ consensus, ratings })));
   };
   return makeSource('arbiter', 99, 1, complete);

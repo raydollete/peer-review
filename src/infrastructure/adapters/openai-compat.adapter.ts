@@ -1,7 +1,7 @@
 import { ok, err, type Result } from 'neverthrow';
 import { z } from 'zod';
 import type { IPeerClient } from '../../domain/ports/index.js';
-import type { PeerRequest, PeerResponse, TokenCountResult } from '../../domain/entities/index.js';
+import { promptText, type PeerRequest, type PeerResponse, type TokenCountResult } from '../../domain/entities/index.js';
 import { ExternalServiceError, type DomainError } from '../../shared/errors/index.js';
 import { EmptyPeerAnswerError, TruncatedPeerAnswerError } from '../../domain/errors/index.js';
 import type { ILogger } from '../../shared/logger/index.js';
@@ -30,6 +30,14 @@ const CompletionSchema = z.object({
       prompt_tokens: z.number(),
       completion_tokens: z.number(),
       total_tokens: z.number(),
+      // Cached tokens are already inside prompt_tokens. OpenAI-style gateways
+      // report them under prompt_tokens_details, DeepSeek as
+      // prompt_cache_hit_tokens; an odd shape degrades to absent (0).
+      prompt_tokens_details: z
+        .object({ cached_tokens: z.number().nullish().catch(undefined) })
+        .nullish()
+        .catch(undefined),
+      prompt_cache_hit_tokens: z.number().nullish().catch(undefined),
     })
     .optional(),
 });
@@ -108,7 +116,7 @@ export class OpenAiCompatAdapter implements IPeerClient {
         content: turn.content,
       });
     }
-    messages.push({ role: 'user', content: request.prompt });
+    messages.push({ role: 'user', content: promptText(request.prompt) });
     return messages;
   }
 
@@ -152,14 +160,14 @@ export class OpenAiCompatAdapter implements IPeerClient {
     if (extracted.isErr()) {
       return err(extracted.error);
     }
-    const text = extracted.value;
     return ok({
-      text,
+      text: extracted.value,
       model: this.cfg.model,
       source: this.cfg.sourceName,
       finishReason,
       usage: {
         promptTokens: usage?.prompt_tokens ?? 0,
+        cachedPromptTokens: usage?.prompt_tokens_details?.cached_tokens ?? usage?.prompt_cache_hit_tokens ?? 0,
         completionTokens: usage?.completion_tokens ?? 0,
         totalTokens: usage?.total_tokens ?? 0,
       },

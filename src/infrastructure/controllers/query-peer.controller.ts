@@ -17,6 +17,8 @@ export interface QueryPeerResponseData {
     readonly prompt: number;
     readonly completion: number;
     readonly total: number;
+    /** Prompt tokens the providers served from cache; part of `prompt`, not added to `total`. */
+    readonly cachedPrompt: number;
   };
 }
 
@@ -56,6 +58,7 @@ export class QueryPeerController {
         prompt: response.usage.promptTokens,
         completion: response.usage.completionTokens,
         total: response.usage.totalTokens,
+        cachedPrompt: response.usage.cachedPromptTokens,
       },
     });
   }

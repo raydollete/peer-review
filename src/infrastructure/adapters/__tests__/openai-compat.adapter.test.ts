@@ -75,7 +75,7 @@ describe('OpenAiCompatAdapter', () => {
     expect(response.finishReason).toBe('stop');
     expect(response.source).toBe('gpt-large');
     expect(response.model).toBe('model-x');
-    expect(response.usage).toEqual({ promptTokens: 12, completionTokens: 8, totalTokens: 20 });
+    expect(response.usage).toEqual({ promptTokens: 12, cachedPromptTokens: 0, completionTokens: 8, totalTokens: 20 });
 
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe('https://api.example.com/v1/chat/completions');
@@ -277,6 +277,49 @@ describe('OpenAiCompatAdapter', () => {
       totalTokens: 3,
       model: 'model-x',
       method: 'estimate',
+    });
+  });
+
+  describe('prompt caching', () => {
+    it('sends parts byte-identical to the joined string, with no cache field', async () => {
+      const bodyFor = async (prompt: Parameters<OpenAiCompatAdapter['complete']>[0]['prompt']): Promise<string> => {
+        const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse(successFixture));
+        await makeAdapter(fetchMock).complete({ prompt, systemInstruction: 's', history: [{ role: 'user', content: 'h' }] });
+        return String(fetchMock.mock.calls[0]![1]?.body);
+      };
+      const fromParts = await bodyFor([{ text: 'head' }, { text: '\n\nD1', reusable: true }, { text: 'tail', reusable: true }]);
+      expect(fromParts).toBe(await bodyFor('head\n\nD1tail'));
+      expect(fromParts).not.toContain('cache');
+    });
+
+    async function usageFor(usage: Record<string, unknown>): Promise<unknown> {
+      const fetchMock = jest.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ...successFixture, usage }));
+      return (await makeAdapter(fetchMock).complete({ prompt: 'q' }))._unsafeUnwrap().usage;
+    }
+
+    it('reads prompt_tokens_details.cached_tokens without adding it to the prompt total', async () => {
+      expect(
+        await usageFor({ prompt_tokens: 1000, completion_tokens: 10, total_tokens: 1010, prompt_tokens_details: { cached_tokens: 768 } }),
+      ).toEqual({ promptTokens: 1000, cachedPromptTokens: 768, completionTokens: 10, totalTokens: 1010 });
+    });
+
+    it('reads the DeepSeek-style prompt_cache_hit_tokens', async () => {
+      expect(
+        await usageFor({ prompt_tokens: 600, completion_tokens: 10, total_tokens: 610, prompt_cache_hit_tokens: 512 }),
+      ).toEqual({ promptTokens: 600, cachedPromptTokens: 512, completionTokens: 10, totalTokens: 610 });
+    });
+
+    it.each([
+      ['no cache field', {}],
+      ['an odd details shape', { prompt_tokens_details: 'n/a', prompt_cache_hit_tokens: '5' }],
+      ['an odd cached_tokens type', { prompt_tokens_details: { cached_tokens: 'many' } }],
+    ])('reports 0 cached tokens with %s', async (_label, extra) => {
+      expect(await usageFor({ prompt_tokens: 12, completion_tokens: 8, total_tokens: 20, ...extra })).toEqual({
+        promptTokens: 12,
+        cachedPromptTokens: 0,
+        completionTokens: 8,
+        totalTokens: 20,
+      });
     });
   });
 });

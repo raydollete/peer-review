@@ -1,5 +1,8 @@
 export interface TokenUsage {
+  /** The full prompt size, cached tokens included. */
   readonly promptTokens: number;
+  /** Prompt tokens the provider served from cache — a subset of promptTokens. */
+  readonly cachedPromptTokens: number;
   readonly completionTokens: number;
   readonly totalTokens: number;
 }

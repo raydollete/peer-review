@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { err, type Result } from 'neverthrow';
 import type { HistoryTurn, PeerResponse, QuorumResult, ArbiterErrorRecord } from '../entities/index.js';
 import type { PeerSource } from '../ports/index.js';
@@ -51,7 +52,11 @@ export interface QuorumDeps {
 export interface RunState extends AbortOriginFlags {
   readonly reports: Map<string, MutableReport>;
   readonly successes: Array<{ source: PeerSource; response: PeerResponse }>;
-  readonly usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+  readonly usage: { promptTokens: number; cachedPromptTokens: number; completionTokens: number; totalTokens: number };
+  /** Unguessable arbiter fence token (OWASP LLM01), minted once per run and
+   * shared by every arbiter request in it so the repeat stays cacheable; never
+   * sent to a peer, logged, or returned. */
+  readonly fenceTag: string;
   lastEval: AgreementEvaluation | undefined;
   agreeingWeight: number;
   achieved: boolean;
@@ -87,7 +92,8 @@ export class PeerReviewQuorumUseCase {
     const state: RunState = {
       reports: new Map(),
       successes: [],
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      fenceTag: randomBytes(16).toString('hex'),
       lastEval: undefined,
       agreeingWeight: 0,
       achieved: false,

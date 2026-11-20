@@ -29,6 +29,7 @@ export async function evaluateRun(
     // the adapter echoed — so the arbiter's D<n> maps straight onto a row.
     responses: state.successes.map((s) => ({ ...s.response, source: s.source.name })),
     callerAnswer: input.callerAnswer,
+    fenceTag: state.fenceTag,
     signal,
     logger: deps.logger,
   });
@@ -60,6 +61,7 @@ export async function evaluateRun(
   state.lastEval = evaluation.value;
   state.evaluatedCount = state.successes.length;
   state.usage.promptTokens += evaluation.value.usage.promptTokens;
+  state.usage.cachedPromptTokens += evaluation.value.usage.cachedPromptTokens;
   state.usage.completionTokens += evaluation.value.usage.completionTokens;
   state.usage.totalTokens += evaluation.value.usage.totalTokens;
 

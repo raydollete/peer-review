@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { ok, err, type Result } from 'neverthrow';
 import { z } from 'zod';
 import type { PeerResponse, TokenUsage } from '../entities/index.js';
@@ -58,6 +57,9 @@ export interface EvaluateAgreementParams {
   readonly responses: readonly PeerResponse[];
   /** The calling agent's own answer — rated by the arbiter, never sent to peers. */
   readonly callerAnswer?: string | undefined;
+  /** The run's fence token: minted once per run, shared by every arbiter request
+   * in it (re-ask and escalations), never sent to a peer. */
+  readonly fenceTag: string;
   readonly signal?: AbortSignal | undefined;
   readonly logger?: Pick<ILogger, 'warn'> | undefined;
 }
@@ -224,28 +226,26 @@ function warnMalformed(params: EvaluateAgreementParams, attempt: number, reply: 
 export async function evaluateAgreement(
   params: EvaluateAgreementParams,
 ): Promise<Result<AgreementEvaluation, DomainError>> {
-  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const usage = { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let reask = REASK_SUFFIX;
   // A valid reply that left ids unrated: the re-ask may only improve on it, so a
   // failed re-ask falls back to it rather than failing the whole evaluation.
   let incomplete: z.infer<typeof EvaluationSchema> | undefined;
 
+  // One prompt per evaluation, built from the run's fence token; the re-ask
+  // repeats it unchanged and appends its correction as a separate part.
+  const prompt = buildArbiterPrompt(
+    params.question,
+    params.responses.map((response) => response.text),
+    params.callerAnswer,
+    params.fenceTag,
+  );
+  const systemInstruction =
+    ARBITER_SYSTEM_PROMPT + (params.callerAnswer === undefined ? '' : callerRulesSuffix(params.fenceTag));
+
   for (const attempt of [0, 1]) {
-    // Per-attempt unguessable fence token (OWASP LLM01): prompt and system rules
-    // are built from this one tag, and each re-ask is a fresh stateless call.
-    const fenceTag = randomBytes(16).toString('hex');
-    const prompt = buildArbiterPrompt(
-      params.question,
-      params.responses.map((response) => response.text),
-      params.callerAnswer,
-      fenceTag,
-    );
-    const systemInstruction =
-      params.callerAnswer === undefined
-        ? ARBITER_SYSTEM_PROMPT
-        : ARBITER_SYSTEM_PROMPT + callerRulesSuffix(fenceTag);
     const result = await params.arbiter.client.complete({
-      prompt: attempt === 0 ? prompt : prompt + reask,
+      prompt: attempt === 0 ? prompt : [...prompt, { text: reask }],
       systemInstruction,
       temperature: 0,
       signal: params.signal,
@@ -257,6 +257,7 @@ export async function evaluateAgreement(
         : err(result.error);
     }
     usage.promptTokens += result.value.usage.promptTokens;
+    usage.cachedPromptTokens += result.value.usage.cachedPromptTokens;
     usage.completionTokens += result.value.usage.completionTokens;
     usage.totalTokens += result.value.usage.totalTokens;
 

@@ -299,7 +299,7 @@ export interface Settled {
  * stays the single home of report bookkeeping). */
 export interface RecordState extends StragglerState {
   successes: Array<{ source: PeerSource; response: PeerResponse }>;
-  usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+  usage: { promptTokens: number; cachedPromptTokens: number; completionTokens: number; totalTokens: number };
 }
 
 /** Fold one settled peer into the run: its roster row, the success list, and the
@@ -322,6 +322,7 @@ export function recordSettled(
     state.successes.push({ source: settled.source, response: settled.result.value });
     const usage = settled.result.value.usage;
     state.usage.promptTokens += usage.promptTokens;
+    state.usage.cachedPromptTokens += usage.cachedPromptTokens;
     state.usage.completionTokens += usage.completionTokens;
     state.usage.totalTokens += usage.totalTokens;
     return;

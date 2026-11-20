@@ -181,7 +181,7 @@ Tier 1 fans out to `gemini-flash` and `gpt-mini`; both agree, but their combined
       { "name": "gemini-pro",   "model": "gemini-3-pro",           "status": "ok", "weight": 2, "agreement": 0.95 }
     ]
   },
-  "tokenUsage": { "prompt": 812, "completion": 118, "total": 930 }   // includes both arbiter rounds
+  "tokenUsage": { "prompt": 812, "completion": 118, "total": 930, "cachedPrompt": 0 }   // includes both arbiter rounds
 }
 ```
 
@@ -206,7 +206,7 @@ Now the required weight is tier 1's threshold (2). Both flash sources agree, quo
       { "name": "gpt-mini",     "model": "gpt-5-mini",             "status": "ok", "weight": 1, "agreement": 0.9 }
     ]
   },
-  "tokenUsage": { "prompt": 296, "completion": 41, "total": 337 }
+  "tokenUsage": { "prompt": 296, "completion": 41, "total": 337, "cachedPrompt": 0 }
 }
 ```
 
@@ -233,7 +233,7 @@ Now the required weight is tier 1's threshold (2). Both flash sources agree, quo
       { "name": "claude",       "model": "claude-fable-5",         "status": "ok", "weight": 2, "agreement": 0.85 }
     ]
   },
-  "tokenUsage": { "prompt": 2140, "completion": 486, "total": 2626 }
+  "tokenUsage": { "prompt": 2140, "completion": 486, "total": 2626, "cachedPrompt": 1024 }
 }
 ```
 
@@ -260,7 +260,7 @@ Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `
       { "name": "claude",       "model": "claude-fable-5",         "status": "ok",          "weight": 2, "agreement": 0.95 }
     ]
   },
-  "tokenUsage": { "prompt": 640, "completion": 97, "total": 737 }
+  "tokenUsage": { "prompt": 640, "completion": 97, "total": 737, "cachedPrompt": 0 }
 }
 ```
 
@@ -289,7 +289,7 @@ You already have an answer and want independent endorsement. The peers never see
       { "name": "gemini-pro",   "model": "gemini-3-pro",           "status": "ok", "weight": 2, "agreement": 0.95 }
     ]
   },
-  "tokenUsage": { "prompt": 934, "completion": 141, "total": 1075 }
+  "tokenUsage": { "prompt": 934, "completion": 141, "total": 1075, "cachedPrompt": 0 }
 }
 ```
 
@@ -332,9 +332,11 @@ Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `hist
       { "name": "gemini-b", "model": "google/gemini-3.5-flash", "status": "ok", "weight": 1, "agreement": 1 }
     ]
   },
-  "tokenUsage": { "prompt": 315, "completion": 45, "total": 360 }   // aggregated across peers + arbiter
+  "tokenUsage": { "prompt": 315, "completion": 45, "total": 360, "cachedPrompt": 0 }   // aggregated across peers + arbiter
 }
 ```
+
+`tokenUsage.cachedPrompt` counts the prompt tokens the providers served from cache; it is part of `prompt`, not added to `total`.
 
 A third, slower tier-1 peer that was still answering when `gemini-a` and `gemini-b` met the bar would appear alongside them as:
 
@@ -370,7 +372,7 @@ How it behaves:
   "certaintyScore": 1,            // unchanged by callerAnswer — derived from peers only
   "callerAgreement": 1,          // arbiter's 0–1 rating of "Paris" vs the peer consensus
   "quorum": { "achieved": true, "requiredWeight": 2, "agreeingWeight": 2, /* … */ },
-  "tokenUsage": { "prompt": 315, "completion": 45, "total": 360 }
+  "tokenUsage": { "prompt": 315, "completion": 45, "total": 360, "cachedPrompt": 0 }
 }
 ```
 
@@ -385,7 +387,7 @@ Single-source escape hatch mirroring the reference `query_gemini`. Input: `promp
 { "prompt": "In one word, what color is the sky on a clear day?", "source": "gemini" }
 // response data
 { "response": "Blue", "model": "google/gemini-3.5-flash", "source": "gemini", "finishReason": "stop",
-  "tokenUsage": { "prompt": 14, "completion": 1, "total": 15 } }
+  "tokenUsage": { "prompt": 14, "completion": 1, "total": 15, "cachedPrompt": 0 } }
 ```
 
 ### `list_peers`

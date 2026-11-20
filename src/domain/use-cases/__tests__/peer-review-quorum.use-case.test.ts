@@ -12,7 +12,7 @@ import {
   ValidationError,
 } from '../../errors/index.js';
 import { ExternalServiceError, TimeoutError, type DomainError } from '../../../shared/errors/index.js';
-import type { PeerResponse, QuorumSourceReport } from '../../entities/index.js';
+import { promptText, type PeerResponse, type QuorumSourceReport } from '../../entities/index.js';
 import type { PeerSource } from '../../ports/index.js';
 import {
   makeSource,
@@ -308,7 +308,7 @@ describe('PeerReviewQuorumUseCase', () => {
     const arbiter = makeSource('arbiter', 99, 1, (request) => {
       arbiterCall += 1;
       const ratings = arbiterCall === 1 ? { a: 0.2 } : { a: 0.9, b: 0.9 };
-      const body = scriptedRatings(request.prompt, ratings);
+      const body = scriptedRatings(promptText(request.prompt), ratings);
       const reply = ok(peerResponse('arbiter', JSON.stringify({ consensus: 'CONSENSUS', ratings: body })));
       return arbiterCall === 1
         ? new Promise((resolve) => setTimeout(() => resolve(reply), 600))
@@ -583,7 +583,7 @@ describe('PeerReviewQuorumUseCase', () => {
 
     expect(JSON.stringify(a.calls)).not.toContain('MY-SECRET-DRAFT');
     expect(JSON.stringify(b.calls)).not.toContain('MY-SECRET-DRAFT');
-    expect(arbiter.calls[0]?.prompt).toContain('MY-SECRET-DRAFT');
+    expect(promptText(arbiter.calls[0]!.prompt)).toContain('MY-SECRET-DRAFT');
     expect(result.callerAgreement).toBe(0.8);
   });
 
@@ -1059,7 +1059,7 @@ describe('PeerReviewQuorumUseCase', () => {
             'arbiter',
             JSON.stringify({
               consensus: 'CONSENSUS',
-              ratings: scriptedRatings(request.prompt, { a: 1, c: 1 }),
+              ratings: scriptedRatings(promptText(request.prompt), { a: 1, c: 1 }),
             }),
           ),
         ),
@@ -1416,7 +1416,7 @@ describe('PeerReviewQuorumUseCase: abort attribution', () => {
       reports: new Map([[source.name, report]]),
       settled: new Set<string>(),
       successes: [],
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
     recordSettled(state, { source, result: err(error) }, logger);
     return report;
@@ -1484,7 +1484,7 @@ describe('PeerReviewQuorumUseCase: abort attribution', () => {
       ]),
       settled: new Set<string>(),
       successes: [],
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
     const { warnings, debugs, logger } = collectors();
 

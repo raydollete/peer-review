@@ -31,6 +31,8 @@ export interface PeerReviewResponseData {
     readonly prompt: number;
     readonly completion: number;
     readonly total: number;
+    /** Prompt tokens the providers served from cache; part of `prompt`, not added to `total`. */
+    readonly cachedPrompt: number;
   };
 }
 
@@ -87,6 +89,7 @@ export class PeerReviewController {
         prompt: quorum.usage.promptTokens,
         completion: quorum.usage.completionTokens,
         total: quorum.usage.totalTokens,
+        cachedPrompt: quorum.usage.cachedPromptTokens,
       },
     });
   }

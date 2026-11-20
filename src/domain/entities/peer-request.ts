@@ -3,8 +3,21 @@ export interface HistoryTurn {
   readonly content: string;
 }
 
+/** One ordered piece of a prompt. `reusable` means a later request in the same
+ * run is expected to repeat every part up to and including this one, so an
+ * adapter may ask its provider to cache that prefix. */
+export interface PromptPart {
+  readonly text: string;
+  readonly reusable?: boolean | undefined;
+}
+
+/** The prompt as one string: parts joined in order; a string passes through. */
+export function promptText(prompt: string | readonly PromptPart[]): string {
+  return typeof prompt === 'string' ? prompt : prompt.map((part) => part.text).join('');
+}
+
 export interface PeerRequest {
-  readonly prompt: string;
+  readonly prompt: string | readonly PromptPart[];
   readonly history?: readonly HistoryTurn[] | undefined;
   readonly systemInstruction?: string | undefined;
   /** Server-controlled sampling temperature; never client-suppliable. */

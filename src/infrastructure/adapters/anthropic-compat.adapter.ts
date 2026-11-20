@@ -14,7 +14,15 @@ const ANTHROPIC_VERSION = '2023-06-01';
 const MessageResponseSchema = z.object({
   content: z.array(z.object({ type: z.string(), text: z.string().optional() })),
   stop_reason: z.string().nullish(),
-  usage: z.object({ input_tokens: z.number(), output_tokens: z.number() }).optional(),
+  usage: z
+    .object({
+      input_tokens: z.number(),
+      output_tokens: z.number(),
+      // Cache fields are optional; an odd shape degrades to absent (0).
+      cache_read_input_tokens: z.number().nullish().catch(undefined),
+      cache_creation_input_tokens: z.number().nullish().catch(undefined),
+    })
+    .optional(),
 });
 
 const CountTokensResponseSchema = z.object({ input_tokens: z.number() });
@@ -29,7 +37,10 @@ export interface AnthropicCompatAdapterConfig {
   readonly logger?: Pick<ILogger, 'warn'>;
 }
 
-type WireMessage = { role: 'user' | 'assistant'; content: string };
+type TextBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } };
+type WireMessage = { role: 'user' | 'assistant'; content: string | TextBlock[] };
+
+const EPHEMERAL = { type: 'ephemeral' } as const;
 
 export class AnthropicCompatAdapter implements IPeerClient {
   constructor(
@@ -109,8 +120,26 @@ export class AnthropicCompatAdapter implements IPeerClient {
         content: turn.content,
       });
     }
-    messages.push({ role: 'user', content: request.prompt });
+    messages.push({ role: 'user', content: this.finalContent(request) });
     return messages;
+  }
+
+  /** The final user message. A one-shot string prompt stays a plain string (no
+   * cache write for a prompt never repeated); parts become one text block each,
+   * with a cache breakpoint on each reusable part; a string prompt after history
+   * is one marked block, so the next turn reads the conversation from cache. */
+  private finalContent(request: PeerRequest): string | TextBlock[] {
+    if (typeof request.prompt !== 'string') {
+      return request.prompt.map((part) =>
+        part.reusable === true
+          ? { type: 'text', text: part.text, cache_control: EPHEMERAL }
+          : { type: 'text', text: part.text },
+      );
+    }
+    if ((request.history ?? []).length === 0) {
+      return request.prompt;
+    }
+    return [{ type: 'text', text: request.prompt, cache_control: EPHEMERAL }];
   }
 
   private normalize(raw: unknown): Result<PeerResponse, DomainError> {
@@ -124,7 +153,11 @@ export class AnthropicCompatAdapter implements IPeerClient {
       .join('');
     const finishReason = parsed.data.stop_reason ?? 'unknown';
     const usage = parsed.data.usage;
-    const inputTokens = usage?.input_tokens ?? 0;
+    // `input_tokens` counts only the uncached tail; the full prompt adds what
+    // the cache served and what it wrote.
+    const cachedTokens = usage?.cache_read_input_tokens ?? 0;
+    const inputTokens =
+      (usage?.input_tokens ?? 0) + cachedTokens + (usage?.cache_creation_input_tokens ?? 0);
     const outputTokens = usage?.output_tokens ?? 0;
     const unusable = this.unusableAnswer(text, finishReason, outputTokens);
     if (unusable !== undefined) {
@@ -137,6 +170,7 @@ export class AnthropicCompatAdapter implements IPeerClient {
       finishReason,
       usage: {
         promptTokens: inputTokens,
+        cachedPromptTokens: cachedTokens,
         completionTokens: outputTokens,
         totalTokens: inputTokens + outputTokens,
       },
