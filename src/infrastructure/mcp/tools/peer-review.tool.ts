@@ -22,7 +22,7 @@ Use this tool when you need:
 - A confidence signal (certaintyScore 0-1) you can act on programmatically
 - Design/code review sign-off where agreement between models matters
 
-Sources are consulted in cost tiers: cheap tier-1 peers first, escalating to higher tiers only if agreement falls short of the configured weight threshold. The response itemizes every consulted source with its status and agreement rating, so degraded quorums (failed or unavailable peers) are always visible. An unmet quorum is NOT an error — inspect quorum.achieved and certaintyScore. Each rated source carries the arbiter's one-line reason, even when the consensus prose is withheld; an ok source with agreement null was not rated, and its note says why.`,
+Sources are consulted in cost tiers: cheap tier-1 peers first, escalating to higher tiers only if agreement falls short of the configured weight threshold. The response itemizes every consulted source with its status and agreement rating, so degraded quorums (failed or unavailable peers) are always visible. An unmet quorum is normally a verdict, not an error — inspect quorum.achieved and certaintyScore — except a shortfall whose missing weight belongs to a source dropped for lateness: that returns a failure with error.cause "deadline" naming the late source, whose fix tells you to raise the saved review deadline so each tier's slice covers its slowest source, or lower that source's maxOutputTokens/timeoutMs. Each rated source carries the arbiter's one-line reason, even when the consensus prose is withheld; an ok source with agreement null was not rated, and its note says why.`,
   annotations: { readOnlyHint: true, openWorldHint: true },
   inputSchema: {
     type: 'object',

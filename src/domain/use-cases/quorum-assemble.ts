@@ -24,6 +24,13 @@ import { UNRATED_RUN_ENDED } from './source-reports.js';
  * stays honestly transcribable. Any arbiter failure — including a later tier's
  * re-evaluation failing after an earlier tier succeeded — forces the fallback
  * path so a stale consensus never surfaces with a non-zero certainty.
+ *
+ * One not-achieved shape is a failure rather than a verdict: when the weight the
+ * run still needed belongs to a source a clock dropped while it was in flight
+ * (see {@link lateQuorumLoss}), that weight was never attainable inside the
+ * budget, so the run reports itself unreachable. `deadlineMs` is the run's wall —
+ * the number `markDeadlineStragglers` stamps on its stragglers — which is what
+ * separates the wall's rows from a peer that exceeded its own `timeoutMs`.
  */
 export function assembleResult(
   input: QuorumInput,
@@ -31,6 +38,7 @@ export function assembleResult(
   tier: number,
   requiredWeight: number,
   peerSources: readonly PeerSource[],
+  deadlineMs: number,
 ): Result<QuorumResult, DomainError> {
   // An ok row no completed evaluation rated (deadline mid-evaluation, or a peer
   // that answered during the deciding one) still says why it has no rating.
@@ -47,6 +55,16 @@ export function assembleResult(
     sources,
     usage: { ...state.usage },
   };
+
+  // Weight lost to lateness is an unreachable quorum, not a low-certainty
+  // verdict: report it as a failure so the caller repairs the budget instead of
+  // reading a quiet shortfall. Keyed on lateness alone — a shortfall owned by a
+  // rate-limited, credential- or transport-failed peer, and a run whose
+  // attainable weight simply was not agreed, keep the envelopes below.
+  const unreachable = lateQuorumFailure(state, sources, tier, requiredWeight, deadlineMs);
+  if (unreachable !== undefined) {
+    return err(unreachable);
+  }
 
   if (state.lastEval !== undefined && !state.arbiterFailed) {
     return lastEvalResult(input, state.lastEval, state.achieved, state.agreeingWeight, base);
@@ -74,6 +92,72 @@ export function assembleResult(
     ...(input.callerAnswer !== undefined ? { callerAgreement: null } : {}),
     ...base,
   });
+}
+
+/** Whether this roster row was dropped for lateness: a clock took it while it
+ * was still in flight. `cause: 'deadline'` alone fuses three clocks
+ * (`TimeoutError`, `CancellationError` and `TierBudgetElapsedError` all map to
+ * it), so the budget stamped on the row discriminates — absent means the tier's
+ * slice expired (`markPendingOutage` stamps none), equal to the run's wall means
+ * the outer wall's straggler (`markDeadlineStragglers` stamps the wall's
+ * number). A row stamped with any other `timeoutMs` exceeded its OWN budget, and
+ * the wall is not its repair: it keeps today's envelope. */
+function isLateDrop(report: QuorumSourceReport, deadlineMs: number): boolean {
+  return (
+    report.status === 'error' &&
+    report.cause === 'deadline' &&
+    (report.timeoutMs === undefined || report.timeoutMs === deadlineMs)
+  );
+}
+
+/** The unreachable-quorum report of a run that lost the weight it still needed
+ * to a clock, or `undefined` when its miss is not one lateness caused. Present
+ * only when the run answered at least one source, the arbiter did not fail, the
+ * settled weight sits below `requiredWeight`, and a consulted row is late by
+ * {@link isLateDrop}. The top-level source is the heaviest late row (ties keep
+ * roster order, the tie-break `leadFailure` applies); the detail states the
+ * settled weight against the required one and names every late source; the fix
+ * names the wall that has to grow, or the output budget that has to shrink; the
+ * roster rides in `context` so the caller still sees each row's own cause. */
+function lateQuorumFailure(
+  state: RunState,
+  sources: readonly QuorumSourceReport[],
+  tier: number,
+  requiredWeight: number,
+  deadlineMs: number,
+): QuorumFailureError | undefined {
+  if (state.achieved || state.arbiterFailed || state.successes.length === 0) {
+    return undefined;
+  }
+  const settledWeight = state.successes.reduce((sum, success) => sum + success.source.weight, 0);
+  if (settledWeight >= requiredWeight) {
+    return undefined;
+  }
+  const late = sources.filter((report) => isLateDrop(report, deadlineMs));
+  if (late.length === 0) {
+    return undefined;
+  }
+  const lead = late.reduce((heaviest, report) =>
+    report.weight > heaviest.weight ? report : heaviest,
+  );
+  const names = late.map((report) => report.name).join(', ');
+  const context: QuorumErrorContext = {
+    tier,
+    requiredWeight,
+    agreeingWeight: state.agreeingWeight,
+    sources,
+  };
+  return new QuorumFailureError(
+    'Quorum unreachable: a source was dropped for lateness',
+    'peer-review',
+    {
+      cause: 'deadline',
+      source: lead.name,
+      detail: `Settled weight ${settledWeight} of the ${requiredWeight} required; dropped for lateness: ${names} — see error.context.sources[]`,
+      fix: `Raise the review deadline saved in the app (runtime.deadlineMs, rendered as PEER_REVIEW_DEADLINE_MS) so each tier's slice covers its slowest source at its output budget, or lower ${lead.name}'s maxOutputTokens/timeoutMs`,
+      context,
+    },
+  );
 }
 
 /**

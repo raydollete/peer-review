@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { err, type Result } from 'neverthrow';
 import type { HistoryTurn, PeerResponse, QuorumResult, ArbiterErrorRecord } from '../entities/index.js';
 import type { PeerSource } from '../ports/index.js';
-import { ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
+import { CancellationError, ConfigurationError, ExternalServiceError, ValidationError } from '../errors/index.js';
 import type { DomainError } from '../errors/index.js';
 import type { AgreementEvaluation } from './agreement.js';
 import { initialAbortAttribution, markCancelledStragglers, markDeadlineStragglers, markSkipped, markTierSkippedForTime, noteUnknownCallerSource, recordSettled, seedReport, watchAbortOrigins } from './source-reports.js';
@@ -132,7 +132,8 @@ export class PeerReviewQuorumUseCase {
     // stragglers are left to markDeadlineStragglers below).
     markCancelledStragglers(state);
     markDeadlineStragglers(state, this.deps.deadlineMs);
-    return assembleResult(input, state, state.reachedTier, requiredWeight, this.deps.sources);
+    const { sources, deadlineMs } = this.deps;
+    return assembleResult(input, state, state.reachedTier, requiredWeight, sources, deadlineMs);
   }
 
   /**
@@ -327,8 +328,11 @@ export class PeerReviewQuorumUseCase {
   }
 
   /** A tier slice ended while an evaluation outlasted it: keep every peer that
-   * already answered — only an ok() result is an answer; a settled error is the
-   * abort's own. Returns whether any answer was kept. */
+   * already reached a verdict. An ok() result is an answer; a settled failure of
+   * the peer's own (429, transport, truncation) is its verdict too, and recording
+   * it here is what keeps `markPendingOutage` from overwriting that cause with the
+   * tier clock's. Only the clock's own cancellation stays in flight for
+   * `markPendingOutage` to attribute. Returns whether an ok answer was kept. */
   private async keepSettledAnswers(
     pending: Map<number, Promise<{ key: number; settled: Settled }>>,
     inflight: Map<number, PeerSource>,
@@ -338,11 +342,15 @@ export class PeerReviewQuorumUseCase {
     let kept = false;
     for (const [key, promise] of pending) {
       const winner = await Promise.race([promise, Promise.resolve(sentinel)]);
-      if (winner !== sentinel && winner.settled.result.isOk()) {
+      if (winner === sentinel) {
+        continue;
+      }
+      const { result } = winner.settled;
+      if (result.isOk() || !(result.error instanceof CancellationError)) {
         pending.delete(key);
         inflight.delete(key);
         recordSettled(state, winner.settled, this.deps.logger);
-        kept = true;
+        kept = kept || result.isOk();
       }
     }
     return kept;

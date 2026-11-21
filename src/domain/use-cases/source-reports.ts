@@ -143,14 +143,26 @@ export function markSkipped(
 }
 
 /** Escalation reached a tier with no time left before the deadline after the
- * arbiter reserve: none of its sources is called, each itemized as skipped. */
+ * arbiter reserve: none of its sources is called, each itemized as skipped.
+ * The machine cause is the clock's (`deadline` → the budget repair), not the
+ * redundant-peer `configuration` default. A source already itemized as
+ * `unavailable` — a credential the run could not resolve — keeps its own status
+ * and cause: the clock is not why that source is absent. */
 export function markTierSkippedForTime(
   sources: readonly PeerSource[],
   reports: Map<string, MutableReport>,
 ): void {
   for (const source of sources) {
-    const report = seedReport(source);
-    markSkipped(report, 'Skipped: no time left before the deadline after the arbiter reserve');
+    const report = reports.get(source.name) ?? seedReport(source);
+    if (report.status === 'unavailable') {
+      reports.set(source.name, report);
+      continue;
+    }
+    markSkipped(
+      report,
+      'Skipped: no time left before the deadline after the arbiter reserve',
+      'deadline',
+    );
     reports.set(source.name, report);
   }
 }

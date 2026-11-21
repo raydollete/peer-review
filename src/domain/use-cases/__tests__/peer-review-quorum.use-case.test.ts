@@ -10,6 +10,7 @@ import {
   QuorumFailureError,
   TransportError,
   ValidationError,
+  causeOf,
 } from '../../errors/index.js';
 import { ExternalServiceError, TimeoutError, type DomainError } from '../../../shared/errors/index.js';
 import { promptText, type PeerResponse, type QuorumSourceReport } from '../../entities/index.js';
@@ -154,7 +155,7 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(bReport?.agreement).toBe(0.2);
   });
 
-  it('deadline mid-fan-out returns the accumulated partial result', async () => {
+  it('reports a deadline mid-fan-out whose lost weight was lateness as unreachable', async () => {
     const a = makeSource('a', 1, 2, answers('a', 'fast answer'));
     const b = makeSource('b', 1, 2, resolvesOnAbortOnly);
     const arbiter = makeArbiter([{ a: 0.9 }]);
@@ -165,17 +166,24 @@ describe('PeerReviewQuorumUseCase', () => {
       deadlineMs: 50,
     });
 
-    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+    const result = await useCase.execute({ prompt: 'q' });
 
-    expect(result.achieved).toBe(false);
-    expect(result.certaintyScore).toBe(0);
-    // Quorum not achieved, so the prose is withheld: '' plus the signal. The
-    // partial result is still fully transcribable from the metadata below.
-    expect(result.response).toBe('');
-    expect(result.responseWithheld).toBe(true);
-    expect(result.sources.find((s) => s.name === 'a')?.status).toBe('ok');
-    expect(result.sources.find((s) => s.name === 'b')?.status).toBe('error');
+    // Half the weight died on a clock's abort: the run is unreachable rather than
+    // a withheld-prose verdict, because that weight was never attainable.
+    expect(result.isErr()).toBe(true);
+    const error = result._unsafeUnwrapErr() as QuorumFailureError;
+    expect(error).toBeInstanceOf(QuorumFailureError);
+    expect(causeOf(error)).toBe('deadline');
+    expect(error.source).toBe('b');
+    expect(error.detail).toMatch(/2 of the 4 required/);
+    expect(error.detail).toContain('b');
     expect(arbiter.calls).toHaveLength(0);
+    // The accumulated partial result stays fully transcribable off the error's
+    // roster: the peer that answered, and the row the clock took with its cause.
+    expect(error.context?.sources.find((s) => s.name === 'a')?.status).toBe('ok');
+    const bReport = error.context?.sources.find((s) => s.name === 'b');
+    expect(bReport?.status).toBe('error');
+    expect(bReport?.cause).toBe('deadline');
   });
 
   it('returns at the deadline even when the arbiter ignores the abort', async () => {
@@ -297,6 +305,56 @@ describe('PeerReviewQuorumUseCase', () => {
     const report = result.sources.find((s) => s.name === 'straggler');
     expect(report?.status).toBe('error');
     expect(report?.error).toContain('tier budget elapsed — still in flight');
+    // Pin: the lateness gate turns a not-achieved run into a failure only when
+    // the settled weight falls short of the bar — this run's does not, so the
+    // withheld-prose envelope above stays its contract.
+    expect(
+      result.sources
+        .filter((s) => s.status === 'ok')
+        .reduce((sum, s) => sum + s.weight, 0),
+    ).toBeGreaterThanOrEqual(result.requiredWeight);
+  });
+
+  it('keeps a peer that settled with a real failure inside the tier-abort window its own cause', async () => {
+    // Clock starvation, not a peer outage: `limited` settled with a real 429 the
+    // moment the tier slice expired, while an evaluation outlasted it. Stamping
+    // it with the tier budget discards the only actionable cause the peer gave.
+    const fast = makeSource('fast', 1, 2, answers('fast', 'Paris'));
+    const limited = makeSource('limited', 1, 2, async (request) => {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const signal = request.signal;
+      if (signal?.aborted === true) {
+        resolve();
+      } else {
+        signal?.addEventListener('abort', () => resolve(), { once: true });
+      }
+      await promise;
+      return err(new PeerRateLimitError(1000));
+    });
+    const never = makeSource('never', 1, 2, resolvesOnAbortOnly);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [fast, limited, never],
+      // A rating below the agreement bar: the evaluation ends without quorum, so
+      // the run reaches the tier-abort path with `limited` already settled.
+      arbiter: slowArbiter(120, { fast: 0.2 }),
+      thresholds: { 1: 2 },
+      deadlineMs: 5000,
+      // The slice expires mid-evaluation, which is what opens the window.
+      tierTimeoutMs: { 1: 50 },
+      arbiterTimeoutMs: 1000,
+    });
+
+    const result = (await useCase.execute({ prompt: 'Capital of France?' }))._unsafeUnwrap();
+
+    const limitedReport = result.sources.find((s) => s.name === 'limited');
+    expect(limitedReport?.status).toBe('error');
+    expect(limitedReport?.cause).toBe('rate_limited');
+    expect(limitedReport?.error).toContain('Rate limit exceeded');
+    // The sibling that never answered stays the clock's own outage.
+    const neverReport = result.sources.find((s) => s.name === 'never');
+    expect(neverReport?.status).toBe('error');
+    expect(neverReport?.cause).toBe('deadline');
+    expect(neverReport?.error).toBe('tier budget elapsed — still in flight');
   });
 
   it('keeps a peer that answered inside its slice while an evaluation outlasted it', async () => {
@@ -332,6 +390,13 @@ describe('PeerReviewQuorumUseCase', () => {
     expect(result.achieved).toBe(true);
     expect(result.agreeingWeight).toBe(3);
     expect(result.sources.find((s) => s.name === 'never')?.error).toContain('tier budget elapsed');
+    // Pin: the weight this run could still reach clears the bar, so the
+    // lateness gate in `assembleResult` must never take this envelope away.
+    expect(
+      result.sources
+        .filter((s) => s.status === 'ok')
+        .reduce((sum, s) => sum + s.weight, 0),
+    ).toBeGreaterThanOrEqual(result.requiredWeight);
   });
 
   it('caller tier limits escalation and picks that tier threshold', async () => {
@@ -843,6 +908,90 @@ describe('PeerReviewQuorumUseCase', () => {
     const opusReport = result.sources.find((s) => s.name === 'opus');
     expect(opusReport?.status).toBe('error');
     expect(opusReport?.error).toContain('tier budget elapsed');
+    // Pin: 'a' and 'c' answered, so the settled weight clears the bar — the
+    // lateness gate must leave this run on the withheld-prose envelope.
+    expect(
+      result.sources
+        .filter((s) => s.status === 'ok')
+        .reduce((sum, s) => sum + s.weight, 0),
+    ).toBeGreaterThanOrEqual(result.requiredWeight);
+  });
+
+  it('reports the quorum unreachable when the weight it lost was dropped for lateness', async () => {
+    // The live shape: the weight-3 source is still in flight when its tier's
+    // slice expires, so its weight was never attainable. That run is not a
+    // low-certainty verdict — it is unreachable, and must say so.
+    const haiku = makeSource('haiku', 1, 1, answers('haiku', 'Paris'));
+    const sonnet = makeSource('sonnet', 2, 3, resolvesOnAbortOnly);
+    const arbiter = makeArbiter([{ haiku: 0.2 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [haiku, sonnet],
+      arbiter,
+      thresholds: { 1: 2, 2: 3 },
+      // Tier 2's slice (100 ms) expires well before the 280 ms wall, so `sonnet`
+      // is stamped by the tier slice (no `timeoutMs`), not by its own timeout.
+      deadlineMs: 280,
+      tierTimeoutMs: { 1: 40, 2: 100 },
+      arbiterTimeoutMs: 60,
+    });
+
+    const result = await useCase.execute({ prompt: 'Capital of France?' });
+
+    expect(result.isErr()).toBe(true);
+    const error = result._unsafeUnwrapErr() as QuorumFailureError;
+    expect(error).toBeInstanceOf(QuorumFailureError);
+    expect(causeOf(error)).toBe('deadline');
+    expect(error.source).toBe('sonnet');
+    expect(error.detail).toMatch(/1 of the 3 required/);
+    expect(error.detail).toContain('sonnet');
+    expect(error.fix).toContain('PEER_REVIEW_DEADLINE_MS');
+    expect(error.fix).toContain('maxOutputTokens');
+    expect(error.fix).toContain('sonnet');
+    // The roster survives the move onto the failure path: the peer that answered
+    // is still itemized with its weight and rating.
+    expect(error.context?.tier).toBe(2);
+    expect(error.context?.requiredWeight).toBe(3);
+    expect(error.context?.agreeingWeight).toBe(0);
+    const answered = error.context?.sources.find((s) => s.name === 'haiku');
+    expect(answered?.status).toBe('ok');
+    expect(answered?.weight).toBe(1);
+    expect(answered?.agreement).toBe(0.2);
+    const late = error.context?.sources.find((s) => s.name === 'sonnet');
+    expect(late?.status).toBe('error');
+    expect(late?.cause).toBe('deadline');
+  });
+
+  it('keeps the withheld-prose envelope when the missing weight belongs to a transport-error peer', async () => {
+    // Keyed on lateness alone: the same shape of shortfall owned by a peer that
+    // failed for another reason keeps today's success envelope and its own cause.
+    const haiku = makeSource('haiku', 1, 1, answers('haiku', 'Paris'));
+    const sonnet = makeSource(
+      'sonnet',
+      2,
+      3,
+      async () =>
+        err(new TransportError('Network error: TypeError: fetch failed', 'sonnet', 'ECONNREFUSED')),
+    );
+    const arbiter = makeArbiter([{ haiku: 0.2 }]);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [haiku, sonnet],
+      arbiter,
+      thresholds: { 1: 2, 2: 3 },
+      deadlineMs: 5000,
+    });
+
+    const result = await useCase.execute({ prompt: 'Capital of France?' });
+
+    expect(result.isOk()).toBe(true);
+    const value = result._unsafeUnwrap();
+    expect(value.achieved).toBe(false);
+    expect(value.response).toBe('');
+    expect(value.responseWithheld).toBe(true);
+    expect(value.certaintyScore).toBe(0);
+    expect(value.requiredWeight).toBe(3);
+    const sonnetReport = value.sources.find((s) => s.name === 'sonnet');
+    expect(sonnetReport?.status).toBe('error');
+    expect(sonnetReport?.cause).toBe('peer_unreachable');
   });
 
   it('rates a final-tier peer that answers inside its capped slice', async () => {
@@ -887,6 +1036,39 @@ describe('PeerReviewQuorumUseCase', () => {
     const opusReport = result.sources.find((s) => s.name === 'opus');
     expect(opusReport?.status).toBe('skipped');
     expect(opusReport?.error).toBe('Skipped: no time left before the deadline after the arbiter reserve');
+    expect(result.achieved).toBe(false);
+    expect(result.tier).toBe(1);
+  });
+
+  it('itemizes a time-skipped tier with the deadline cause and never overwrites a credential row', async () => {
+    // The clock starved this tier, so every row it itemizes names the clock — and
+    // a source that was already absent for its credential keeps saying so.
+    const a = makeSource('a', 1, 1, answers('a', 'x'));
+    const opus = makeSource('opus', 2, 2, answers('opus', 'x'));
+    const nokey = makeSource('nokey', 2, 1, answers('nokey', 'unused'), false);
+    const useCase = new PeerReviewQuorumUseCase({
+      sources: [a, opus, nokey],
+      // Tier 1's evaluation runs to 200, so 280 − 200 − 120 leaves tier 2 nothing.
+      arbiter: slowArbiter(200, { a: 1 }),
+      thresholds: { 1: 2, 2: 4 },
+      deadlineMs: 280,
+      tierTimeoutMs: { 1: 120, 2: 300 },
+      arbiterTimeoutMs: 120,
+    });
+
+    const result = (await useCase.execute({ prompt: 'q' }))._unsafeUnwrap();
+
+    expect(opus.calls).toHaveLength(0);
+    expect(nokey.calls).toHaveLength(0);
+    const opusReport = result.sources.find((s) => s.name === 'opus');
+    expect(opusReport?.status).toBe('skipped');
+    expect(opusReport?.error).toBe('Skipped: no time left before the deadline after the arbiter reserve');
+    // Machine cause the clock, so the repair is the budget, not callerSource.
+    expect(opusReport?.cause).toBe('deadline');
+    const nokeyReport = result.sources.find((s) => s.name === 'nokey');
+    expect(nokeyReport?.status).toBe('unavailable');
+    expect(nokeyReport?.cause).toBe('credential');
+    expect(nokeyReport?.error).toBe('Credential not resolvable; source skipped');
     expect(result.achieved).toBe(false);
     expect(result.tier).toBe(1);
   });
@@ -1666,6 +1848,44 @@ describe('PeerReviewQuorumUseCase: abort attribution', () => {
       agreement: null,
       error: 'tier budget elapsed — still in flight',
       cause: 'deadline',
+      note: undefined,
+      timeoutMs: undefined,
+    });
+  });
+
+  it('leaves a row the run already settled to its own verdict when the tier clock runs out', () => {
+    // The guard the two straggler passes already keep, at the tier-outage site:
+    // a peer the orchestrator watched settle carries its own cause, so the clock
+    // that merely stopped waiting for its sibling must not re-stamp it.
+    const limited = makeSource('limited', 1, 2, answers('limited', 'x'));
+    const report = seedReport(limited);
+    const { logger } = collectors();
+    recordSettled(
+      {
+        ...initialAbortAttribution(),
+        runAborted: true,
+        tierClockFired: true,
+        reports: new Map([[limited.name, report]]),
+        settled: new Set<string>(),
+        successes: [],
+        usage: { promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      },
+      { source: limited, result: err(new PeerRateLimitError(1000)) },
+      logger,
+    );
+    const inflight = new Map<number, PeerSource>([[0, limited]]);
+    markPendingOutage(inflight, new Map([[limited.name, report]]), {
+      ...initialAbortAttribution(),
+      runAborted: true,
+      tierClockFired: true,
+      settled: new Set([limited.name]),
+    });
+    expect(rosterRow(report)).toEqual({
+      status: 'error',
+      weight: 2,
+      agreement: null,
+      error: 'Rate limit exceeded. Retry after 1000ms',
+      cause: 'rate_limited',
       note: undefined,
       timeoutMs: undefined,
     });

@@ -11,7 +11,7 @@ A provider-agnostic MCP (Model Context Protocol) server that asks a **weighted q
 - **Weighted quorum with a certainty score** — peers vote with configurable weights; every `peer_review` response carries a machine-consumable `certaintyScore`.
 - **Provider-agnostic** — two wire formats (OpenAI `chat/completions`, Anthropic `v1/messages`) cover OpenAI, Gemini, OpenRouter, Ollama, vLLM, Anthropic, and most gateways.
 - **Cost tiers with escalation** — tier 1 sources are consulted first; higher tiers only fan out on quorum shortfall.
-- **Visible degradation** — failed or unavailable sources are itemized in the result, never silently dropped; an unmet quorum is a reported outcome, not an error.
+- **Visible degradation** — failed or unavailable sources are itemized in the result, never silently dropped; an unmet quorum is a reported verdict, not an error — except a shortfall whose missing weight belongs to a source dropped for lateness, which reports itself as a `deadline` failure naming the source.
 - **No vendor SDKs** — all providers are reached over plain HTTPS `fetch`.
 
 ## Table of Contents
@@ -239,7 +239,7 @@ Now the required weight is tier 1's threshold (2). Both flash sources agree, quo
 
 #### 4. Degraded run — missing credential, quorum unreachable
 
-Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `gemini-flash` and `gemini-pro`. The remaining potential weight (`gpt-mini` 1 + `claude` 2 = 3) can never reach 4, so the call completes with `quorum.achieved: false` — still `success: true`, never an error. The degradation is itemized, not hidden.
+Same easy prompt as scenario 1, but `GEMINI_API_KEY` is unset, taking out both `gemini-flash` and `gemini-pro`. The remaining potential weight (`gpt-mini` 1 + `claude` 2 = 3) can never reach 4, so the call completes with `quorum.achieved: false` — still `success: true`, because the missing weight belongs to sources that were never available, not to a source dropped for lateness (that shortfall is the one that returns a failure, with `error.cause: "deadline"` naming the late source). The degradation is itemized, not hidden.
 
 ```jsonc
 // data
@@ -313,7 +313,7 @@ All tools return the envelope `{"success": true, "data": ...}` or `{"success": f
 
 ### `peer_review`
 
-Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack), optional `callerAnswer` (1–100000 chars — your own answer to the prompt), optional `callerSource` (the name of a configured source the caller itself *is* — skipped as a redundant peer for this request, never called, itemized as `status: "skipped"`; an unknown name is a logged no-op). An unmet quorum is **not** an error — check `quorum.achieved` and `certaintyScore`.
+Weighted-quorum consultation. Input: `prompt` (1–100000 chars), optional `history` (`[{role: "user"|"model", content}]`), optional `tier` (highest tier to escalate to; defaults to the full stack), optional `callerAnswer` (1–100000 chars — your own answer to the prompt), optional `callerSource` (the name of a configured source the caller itself *is* — skipped as a redundant peer for this request, never called, itemized as `status: "skipped"`; an unknown name is a logged no-op). An unmet quorum is normally a verdict, not an error — check `quorum.achieved` and `certaintyScore` — except a shortfall whose missing weight belongs to a source dropped for lateness, which returns a failure with `error.cause: "deadline"` naming that source and a fix naming the deadline or output budget to repair.
 
 ```jsonc
 // request

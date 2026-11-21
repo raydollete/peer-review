@@ -7,6 +7,7 @@ import {
   markFailed,
   type AbortAttribution,
   type MutableReport,
+  type StragglerState,
 } from './source-reports.js';
 
 /** Floor for a tier's time budget: the escalation timebox must never go
@@ -50,15 +51,24 @@ export function signalAbortPromise<T>(signal: AbortSignal, value: T): Promise<T>
  * / caller walked away (not the peer's fault → itemize as cancelled, never as a
  * tier-budget outage). Attribution comes from the run's origin flags, not from
  * the error the request settled with.
+ *
+ * Only a peer the run never heard from is the clock's to explain: a row that
+ * already settled carries its own verdict, so it is skipped here exactly as the
+ * two straggler passes skip it — otherwise a peer that failed for a real reason
+ * (429, transport, truncation) inside the abort window loses that cause to the
+ * clock that merely stopped waiting for its sibling.
  */
 export function markPendingOutage(
   inflight: Map<number, PeerSource>,
   reports: Map<string, MutableReport>,
-  attribution: AbortAttribution,
+  attribution: AbortAttribution & Partial<Pick<StragglerState, 'settled'>>,
 ): void {
   for (const source of inflight.values()) {
     const report = reports.get(source.name);
     if (report === undefined || report.status !== 'error') {
+      continue;
+    }
+    if (attribution.settled?.has(source.name) === true) {
       continue;
     }
     if (abortedByRun(attribution)) {
